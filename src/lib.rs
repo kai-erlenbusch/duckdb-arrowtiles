@@ -273,6 +273,61 @@ impl VArrowScalar for HilbertScalar {
     }
 }
 
+struct HilbertNormalizedScalar;
+
+impl VArrowScalar for HilbertNormalizedScalar {
+    type State = ();
+
+    fn invoke(_: &Self::State, input: RecordBatch) -> std::result::Result<Arc<dyn Array>, Box<dyn Error>> {
+        let x_array = input.column(0).as_any().downcast_ref::<Float64Array>()
+            .ok_or("Failed to downcast x column to Float64")?;
+        let y_array = input.column(1).as_any().downcast_ref::<Float64Array>()
+            .ok_or("Failed to downcast y column to Float64")?;
+        let zoom_array = input.column(2).as_any().downcast_ref::<UInt8Array>()
+            .ok_or("Failed to downcast zoom column to UInt8")?;
+
+        let x_iter = x_array.iter();
+        let y_iter = y_array.iter();
+        let zoom_iter = zoom_array.iter();
+
+        let tile_ids: Vec<Option<u64>> = x_iter.zip(y_iter).zip(zoom_iter).map(|((x_opt, y_opt), zoom_opt)| {
+            match (x_opt, y_opt, zoom_opt) {
+                (Some(x), Some(y), Some(zoom)) => {
+                    if zoom >= 32 {
+                        return None;
+                    }
+                    
+                    let n = (1_u32 << zoom) as f64; 
+                    let max_index = (n as u32) - 1;
+
+                    // Clamp to normalized [0.0, 1.0] bounds and map to grid
+                    let ix = ((x.clamp(0.0, 1.0) * n).floor() as u32).min(max_index);
+                    let iy = ((y.clamp(0.0, 1.0) * n).floor() as u32).min(max_index);
+
+                    // Compute true Hilbert curve index
+                    let h = fast_hilbert::xy2h(ix, iy, zoom as u8);
+                    
+                    // PMTiles z-order hierarchical offset
+                    let offset = ((1_u64 << (zoom * 2)) - 1) / 3;
+                    
+                    Some(h + offset)
+                },
+                _ => None
+            }
+        }).collect();
+
+        Ok(Arc::new(UInt64Array::from(tile_ids)))
+    }
+
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Float64, DataType::Float64, DataType::UInt8],
+            DataType::UInt64,
+        )]
+    }
+}
+
+
 #[duckdb_loadable_macros::duckdb_entrypoint_c_api(ext_name="arrowtiles")]
 pub unsafe fn arrowtiles_init(conn: Connection) -> Result<(), Box<dyn Error>> {
     let (tx, rx) = mpsc::sync_channel::<Request>(1);
@@ -281,8 +336,9 @@ pub unsafe fn arrowtiles_init(conn: Connection) -> Result<(), Box<dyn Error>> {
     // Register table function
     conn.register_table_function_with_extra_info::<ArrowTilesVTab, _>("arrowtiles_export", &tx_mutex)?;
 
-    // Register scalar UDF
+    // Register scalar UDFs
     conn.register_scalar_function::<HilbertScalar>("hilbert_xy")?;
+    conn.register_scalar_function::<HilbertNormalizedScalar>("hilbert_normalized")?;
 
     thread::spawn(move || {
         while let Ok((query, filepath, reply_tx)) = rx.recv() {

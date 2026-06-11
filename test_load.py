@@ -20,6 +20,10 @@ udf_res = conn.execute("SELECT id, lon, lat, hilbert_xy(lon, lat, 10::UTINYINT) 
 for row in udf_res:
     print(f"Row {row[0]}: lon={row[1]}, lat={row[2]} -> tile_id={row[3]}")
 
+print("\nTesting UDF hilbert_normalized...")
+udf_norm = conn.execute("SELECT hilbert_normalized(0.1, 0.9, 10::UTINYINT) as tile_id, hilbert_normalized(1.5, -0.5, 10::UTINYINT) as tile_id_clamped").fetchall()
+print(f"Normalized Result (0.1, 0.9): {udf_norm[0][0]}, Overflows Clamped (1.5, -0.5): {udf_norm[0][1]}")
+
 print("\nTesting ArrowTiles export with UDF sorting...")
 try:
     # We call the table function arrowtiles_export(query, filepath)
