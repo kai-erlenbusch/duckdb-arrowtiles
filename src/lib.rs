@@ -246,8 +246,9 @@ impl VArrowScalar for HilbertScalar {
                     // Calculate number of tiles across one axis at this zoom level (2^zoom)
                     let n = (1_u32 << zoom) as f64; 
 
-                    let x = ((lon + 180.0) / 360.0 * n).floor() as u32;
-                    let y = ((1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor() as u32;
+                    let max_index = (n as u32) - 1;
+                    let x = (((lon + 180.0) / 360.0 * n).floor() as u32).min(max_index);
+                    let y = (((1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor() as u32).min(max_index);
 
                     // Compute true Hilbert curve index
                     let h = fast_hilbert::xy2h(x, y, zoom as u8);
