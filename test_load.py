@@ -13,9 +13,14 @@ except Exception as e:
     exit(1)
 
 # Create some dummy spatial data
-conn.execute("CREATE TABLE spatial_data AS SELECT * FROM (VALUES (1, 40.7128, -74.0060), (2, 34.0522, -118.2437), (3, 51.5074, -0.1278)) t(id, lat, lon)")
+conn.execute("CREATE TABLE spatial_data AS SELECT * FROM (VALUES (1, -74.0060, 40.7128), (2, -118.2437, 34.0522), (3, -0.1278, 51.5074)) t(id, lon, lat)")
 
-print("Testing ArrowTiles export...")
+print("Testing UDF hilbert_xy...")
+udf_res = conn.execute("SELECT id, lon, lat, hilbert_xy(lon, lat) as tile_id FROM spatial_data ORDER BY tile_id").fetchall()
+for row in udf_res:
+    print(f"Row {row[0]}: lon={row[1]}, lat={row[2]} -> tile_id={row[3]}")
+
+print("\nTesting ArrowTiles export with UDF sorting...")
 try:
     # We call the table function arrowtiles_export(query, filepath)
     if os.path.exists("output.feather"):

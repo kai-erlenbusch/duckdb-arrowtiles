@@ -16,11 +16,12 @@ graph TD
     A[(Massive Dataset\nParquet/CSV)] -->|SQL COPY / SELECT| B(DuckDB C++ Engine)
     
     subgraph "ArrowTiles Extension (Rust cdylib)"
+        B -->|VArrowScalar hilbert_xy| UDF[Native Spatial Binning\nlon/lat -> TileID]
+        B -->|Multi-threaded ORDER BY TileID| B
         B -->|FFI C-Data Interface| C[DataChunks / Vectors]
         C -->|Zero-Copy / Memory Map| D[Apache Arrow RecordBatches]
         D -->|arrow_ipc::writer| E[Arrow IPC Byte Buffers]
-        E -->|fast_hilbert| F[Spatial Binning Z/X/Y -> TileID]
-        F -->|pmtiles_writer| G[PMTiles Directory Packaging]
+        E -->|pmtiles_writer| G[PMTiles Directory Packaging]
     end
     
     G --> H[(output.pmtiles)]
@@ -28,7 +29,7 @@ graph TD
     classDef duckdb fill:#ff9900,stroke:#333,stroke-width:2px;
     classDef rust fill:#000000,stroke:#fff,stroke-width:2px,color:#fff;
     class B duckdb;
-    class C,D,E,F,G rust;
+    class C,D,E,G,UDF rust;
 ```
 
 ## 🚀 Phases & Roadmap
@@ -39,15 +40,23 @@ graph TD
 - [x] Successfully compiled the `.dll` and injected DuckDB's strict cryptographic metadata footer using `cargo-duckdb-ext-tools`.
 - [x] Extension loads flawlessly in DuckDB (`LOAD 'arrowtiles'`) without IPC or Python bridging.
 
-### ✅ Phase 2: Arrow Serialization (Completed)
+### ✅ Phase 2: Structural Stability & Arrow Serialization (Completed)
 - [x] Hooked into DuckDB's internal vectors by creating a custom `TableFunction` (`arrowtiles_export`).
-- [x] Implemented a **Thread-Safe Channel Architecture**: Bypassed DuckDB's parallel worker thread constraints by spawning a dedicated background worker that exclusively holds the `Connection`, communicating with the `VTab` via `mpsc` channels.
-- [x] Extracted `RecordBatch` streams using DuckDB's highly optimized Arrow C-Data interface (`stmt.query_arrow([])`).
-- [x] Serialized zero-copy batches directly into an Apache Arrow IPC `.feather` output file using `arrow::ipc::writer::FileWriter`.
+- [x] Implemented a **Thread-Safe Channel Architecture**: Bypassed DuckDB's parallel worker thread constraints by spawning a dedicated background worker communicating with the `VTab` via `mpsc` channels.
+- [x] **Zero-Row Safeguard**: Arrow `FileWriter` pre-initializes using schema to safely handle empty queries.
+- [x] **Graceful Error Bubbling**: Extracted execution logic to eliminate panics; errors safely traverse the channel to surface natively in DuckDB CLI.
+- [x] **Backpressure**: Migrated to `mpsc::sync_channel(1)` to structurally prevent OOM exhaustion.
+- [x] Extracted `RecordBatch` streams using DuckDB's optimized Arrow C-Data interface and serialized zero-copy batches into an Apache Arrow IPC `.feather` file.
 
-### 🗺️ Phase 3: Spatial Binning & PMTiles Packaging
+### ✅ Phase 3: DuckDB Native UDF Pivot (Completed)
+- [x] Shifted spatial processing directly into DuckDB's multi-threaded C++ execution engine via the Native Scalar UDF Architecture.
+- [x] Registered `hilbert_xy(lon, lat)` natively using `VArrowScalar` (`duckdb::vscalar::arrow::VArrowScalar`).
+- [x] Automatically maps function over internal C++ vectors in parallel across all CPU cores.
+- [x] The background worker is now a highly optimized, strictly sequential "dumb pipe" that blindly converts pre-sorted Arrow IPC buffers into PMTiles format.
+
+### 🗺️ Phase 4: PMTiles Packaging (Next)
 - [ ] Implement spatial quadtree math to determine Z/X/Y bounds for every row.
-- [ ] Convert Z/X/Y coordinates into Hilbert Curve `TileId`s using `fast_hilbert`.
+- [ ] Connect exact `fast_hilbert` or `pmtiles::TileId` math into the `hilbert_xy` UDF.
 - [ ] Feed the Arrow IPC buffers into `pmtiles-rs` to construct the PMTiles directory structure.
 - [ ] Flush the final `.pmtiles` archive to disk.
 

@@ -1,15 +1,18 @@
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use duckdb::{Connection, Result, core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId}};
-use std::error::Error;
+use duckdb::vscalar::arrow::{VArrowScalar, ArrowFunctionSignature};
+use arrow::array::{Array, RecordBatch, Float64Array, UInt64Array};
+use arrow::datatypes::DataType;
+use arrow::ipc::writer::FileWriter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, Arc};
+use std::error::Error;
 use std::thread;
-use arrow::ipc::writer::FileWriter;
 use std::fs::File;
 
-// We will send the query and filepath to a background thread that holds the connection
-type Request = (String, String, mpsc::Sender<std::result::Result<usize, String>>);
-type SenderMutex = Arc<Mutex<mpsc::Sender<Request>>>;
+// Channel payload: (Query, Filepath, ReplySender)
+type Request = (String, String, mpsc::SyncSender<std::result::Result<usize, String>>);
+type SenderMutex = Arc<Mutex<mpsc::SyncSender<Request>>>;
 
 struct ArrowTilesVTab;
 
@@ -33,9 +36,7 @@ impl VTab for ArrowTilesVTab {
         let query = bind.get_parameter(0).to_string();
         let filepath = bind.get_parameter(1).to_string();
         
-        // Get the sender from extra_info
         let tx = unsafe { (*bind.get_extra_info::<SenderMutex>()).clone() };
-        
         Ok(ArrowTilesBindData { query, filepath, tx })
     }
 
@@ -52,22 +53,19 @@ impl VTab for ArrowTilesVTab {
         if init_data.done.swap(true, Ordering::Relaxed) {
             output.set_len(0);
         } else {
-            // Send request to background thread
-            let (reply_tx, reply_rx) = mpsc::channel();
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
             bind_data.tx.lock().unwrap().send((bind_data.query.clone(), bind_data.filepath.clone(), reply_tx)).unwrap();
             
-            // Wait for background thread to finish
-            match reply_rx.recv().unwrap() {
-                Ok(rows) => {
+            match reply_rx.recv() {
+                Ok(Ok(rows)) => {
                     let mut vector = output.flat_vector(0);
                     unsafe {
                         vector.as_mut_slice::<i64>()[0] = rows as i64;
                     }
                     output.set_len(1);
                 }
-                Err(e) => {
-                    return Err(e.into());
-                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err("Background thread panicked or disconnected".into()),
             }
         }
         Ok(())
@@ -75,9 +73,59 @@ impl VTab for ArrowTilesVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // query
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // filepath
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ])
+    }
+}
+
+fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result::Result<usize, String> {
+    let mut stmt = conn.prepare(query).map_err(|e| format!("Prepare error: {}", e))?;
+    let arrow_result = stmt.query_arrow([]).map_err(|e| format!("Query arrow error: {}", e))?;
+    let schema = arrow_result.get_schema();
+    
+    let file = File::create(filepath).map_err(|e| format!("File creation error: {}", e))?;
+    let mut writer = FileWriter::try_new(file, schema.as_ref()).map_err(|e| format!("Arrow writer init error: {}", e))?;
+    
+    let mut rows_exported = 0;
+    for batch in arrow_result {
+        writer.write(&batch).map_err(|e| format!("Arrow write error: {}", e))?;
+        rows_exported += batch.num_rows();
+    }
+    writer.finish().map_err(|e| format!("Arrow finish error: {}", e))?;
+    
+    Ok(rows_exported)
+}
+
+struct HilbertScalar;
+
+impl VArrowScalar for HilbertScalar {
+    type State = ();
+
+    fn invoke(_: &Self::State, input: RecordBatch) -> std::result::Result<Arc<dyn Array>, Box<dyn Error>> {
+        let lon_array = input.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        let lat_array = input.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+
+        // For now, simple mock Tile ID computation based on lon/lat to unblock compilation
+        // We will integrate exact fast_hilbert/PMTiles math once API is verified
+        let mut tile_ids = Vec::with_capacity(lon_array.len());
+        for i in 0..lon_array.len() {
+            let lon = lon_array.value(i);
+            let lat = lat_array.value(i);
+            // Example mapping logic
+            let x = ((lon + 180.0) / 360.0 * 1000000.0) as u32;
+            let y = ((lat + 90.0) / 180.0 * 1000000.0) as u32;
+            tile_ids.push((x as u64) << 32 | (y as u64));
+        }
+
+        Ok(Arc::new(UInt64Array::from(tile_ids)))
+    }
+
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Float64, DataType::Float64],
+            DataType::UInt64,
+        )]
     }
 }
 
@@ -85,77 +133,25 @@ impl VTab for ArrowTilesVTab {
 pub unsafe fn arrowtiles_init(conn: Connection) -> Result<(), Box<dyn Error>> {
     println!("🚀 ArrowTiles Extension loaded. Initializing background worker...");
 
-    let (tx, rx) = mpsc::channel::<Request>();
+    let (tx, rx) = mpsc::sync_channel::<Request>(1);
     let tx_mutex = Arc::new(Mutex::new(tx));
 
-    // Register our table function first
+    // Register table function
     conn.register_table_function_with_extra_info::<ArrowTilesVTab, _>("arrowtiles_export", &tx_mutex)?;
 
-    // Spawn the background thread that actually executes the queries
+    // Register scalar UDF
+    conn.register_scalar_function::<HilbertScalar>("hilbert_xy")?;
+
+    // TEST IF FUNCTION EXISTS
+    let mut stmt = conn.prepare("SELECT hilbert_xy(1.0, 2.0) as val").unwrap();
+    let res = stmt.query_arrow([]).unwrap();
+    println!("SUCCESS! hilbert_xy exists on init connection! Rows: {:?}", res.count());
+
     thread::spawn(move || {
         while let Ok((query, filepath, reply_tx)) = rx.recv() {
             println!("ArrowTiles Worker: Executing inner query...");
-            // Execute the inner query
-            match conn.prepare(&query) {
-                Ok(mut stmt) => {
-                    match stmt.query_arrow([]) {
-                        Ok(arrow_result) => {
-                            let mut rows_exported = 0;
-                            let mut writer: Option<FileWriter<File>> = None;
-                            let mut success = true;
-
-                            for batch in arrow_result {
-                                if writer.is_none() {
-                                    match File::create(&filepath) {
-                                        Ok(file) => {
-                                            match FileWriter::try_new(file, batch.schema().as_ref()) {
-                                                Ok(w) => writer = Some(w),
-                                                Err(e) => {
-                                                    let _ = reply_tx.send(Err(format!("Arrow writer error: {}", e)));
-                                                    success = false;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = reply_tx.send(Err(format!("File creation error: {}", e)));
-                                            success = false;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if let Some(w) = writer.as_mut() {
-                                    if let Err(e) = w.write(&batch) {
-                                        let _ = reply_tx.send(Err(format!("Arrow write error: {}", e)));
-                                        success = false;
-                                        break;
-                                    }
-                                }
-                                rows_exported += batch.num_rows();
-                            }
-
-                            if success {
-                                if let Some(mut w) = writer {
-                                    if let Err(e) = w.finish() {
-                                        let _ = reply_tx.send(Err(format!("Arrow finish error: {}", e)));
-                                        success = false;
-                                    }
-                                }
-                                if success {
-                                    let _ = reply_tx.send(Ok(rows_exported));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = reply_tx.send(Err(format!("Query arrow error: {}", e)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = reply_tx.send(Err(format!("Prepare error: {}", e)));
-                }
-            }
+            let result = execute_export(&conn, &query, &filepath);
+            let _ = reply_tx.send(result);
         }
     });
 

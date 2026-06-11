@@ -11,10 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 arrow = { version = "58.0.0", features = ["ipc"] }
 # We use the DuckDB Rust wrapper with extension-module enabled
-duckdb = { version = "1.0.0", features = ["duckdb-loadable-macros", "vtab-loadable", "vtab-arrow"] }
+duckdb = { version = "1.0.0", features = ["duckdb-loadable-macros", "vtab-loadable", "vtab-arrow", "vscalar", "vscalar-arrow"] }
 duckdb-loadable-macros = "1.0.0"
-
-# Future dependencies for Phase 2 and 3
-# arrow = "52.0.0"
-# pmtiles = "0.23.0"
-# fast_hilbert = "2.0.1"
+fast_hilbert = "2.1.0"
