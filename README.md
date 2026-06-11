@@ -54,11 +54,12 @@ graph TD
 - [x] Automatically maps function over internal C++ vectors in parallel across all CPU cores.
 - [x] The background worker is now a highly optimized, strictly sequential "dumb pipe" that blindly converts pre-sorted Arrow IPC buffers into PMTiles format.
 
-### 🗺️ Phase 4: PMTiles Packaging (Next)
-- [ ] Implement spatial quadtree math to determine Z/X/Y bounds for every row.
-- [ ] Connect exact `fast_hilbert` or `pmtiles::TileId` math into the `hilbert_xy` UDF.
-- [ ] Feed the Arrow IPC buffers into `pmtiles-rs` to construct the PMTiles directory structure.
-- [ ] Flush the final `.pmtiles` archive to disk.
+### ✅ Phase 4: PMTiles & Zero-Copy Arrow IPC (Completed)
+- [x] **Web Mercator & Fast Hilbert**: Upgraded the `hilbert_xy` UDF to clamp coordinates safely, project them to Web Mercator Tile X/Y based on the zoom level, and calculate the exact PMTiles Z-order offset.
+- [x] **Global Schema Base64 Injection**: Serializes the Arrow `Schema` into raw bytes, Base64 encodes it, and injects it into the global PMTiles JSON metadata header to avoid schema bloat in every tile.
+- [x] **Zero-Copy Slicing**: Slices contiguous rows inside DuckDB's `RecordBatch` stream natively using Arrow's `.slice()` when the `tile_id` boundary changes.
+- [x] **Strict Safety Validation**: Hard-guards against memory shift panics (`zoom >= 32`) and enforces strictly monotonic sorting rules (`ORDER BY tile_id`). Completely skips CPU-heavy FlatBuffer serialization for skipped or `NULL` bounds.
+- [x] **Low-Level PMTiles Encapsulation**: Discarded heavy `FileWriter` operations in favor of Arrow's `IpcDataGenerator`, generating byte-perfect encoded dictionaries and message buffers strictly mapped to `.pmtiles` archive structures.
 
 ## ⚠️ Known Limitations
 
