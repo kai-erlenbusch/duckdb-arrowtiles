@@ -1,0 +1,19 @@
+[package]
+name = "arrowtiles"
+version = "0.1.0"
+edition = "2021"
+description = "A DuckDB extension to export spatial data to PMTiles Arrow archives"
+
+[lib]
+name = "arrowtiles"
+crate-type = ["cdylib"]
+
+[dependencies]
+# We use the DuckDB Rust wrapper with extension-module enabled
+duckdb = { version = "1.0.0", features = ["duckdb-loadable-macros", "vtab-loadable"] }
+duckdb-loadable-macros = "1.0.0"
+
+# Future dependencies for Phase 2 and 3
+# arrow = "52.0.0"
+# pmtiles = "0.23.0"
+# fast_hilbert = "2.0.1"
