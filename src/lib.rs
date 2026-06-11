@@ -140,7 +140,7 @@ fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result
                 if i > 0 {
                     // Slice the run from the current batch and encode it
                     let run_length = i - current_run_start;
-                    if run_length > 0 {
+                    if run_length > 0 && current_tile_id.is_some() {
                         let sliced_batch = batch.slice(current_run_start, run_length);
                         let mut dictionary_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
                         let (encoded_dictionaries, encoded_message) = data_gen
@@ -171,7 +171,7 @@ fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result
 
         // At the end of the batch, encode any remaining rows for the current tile
         let run_length = batch.num_rows() - current_run_start;
-        if run_length > 0 {
+        if run_length > 0 && current_tile_id.is_some() {
             let sliced_batch = batch.slice(current_run_start, run_length);
             let mut dictionary_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
             let (encoded_dictionaries, encoded_message) = data_gen
@@ -216,6 +216,9 @@ impl VArrowScalar for HilbertScalar {
         let tile_ids: Vec<Option<u64>> = lon_iter.zip(lat_iter).zip(zoom_iter).map(|((lon_opt, lat_opt), zoom_opt)| {
             match (lon_opt, lat_opt, zoom_opt) {
                 (Some(lon), Some(lat), Some(zoom)) => {
+                    if zoom >= 32 {
+                        return None;
+                    }
                     // Safe bounds check (automatically handles NaN because NaN comparisons evaluate to false)
                     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
                         return None; 
@@ -256,8 +259,6 @@ impl VArrowScalar for HilbertScalar {
 
 #[duckdb_loadable_macros::duckdb_entrypoint_c_api(ext_name="arrowtiles")]
 pub unsafe fn arrowtiles_init(conn: Connection) -> Result<(), Box<dyn Error>> {
-    println!("🚀 ArrowTiles Extension loaded. Initializing background worker...");
-
     let (tx, rx) = mpsc::sync_channel::<Request>(1);
     let tx_mutex = Arc::new(Mutex::new(tx));
 
@@ -267,14 +268,8 @@ pub unsafe fn arrowtiles_init(conn: Connection) -> Result<(), Box<dyn Error>> {
     // Register scalar UDF
     conn.register_scalar_function::<HilbertScalar>("hilbert_xy")?;
 
-    // TEST IF FUNCTION EXISTS
-    let mut stmt = conn.prepare("SELECT hilbert_xy(1.0, 2.0, 10::UTINYINT) as val").unwrap();
-    let res = stmt.query_arrow([]).unwrap();
-    println!("SUCCESS! hilbert_xy exists on init connection! Rows: {:?}", res.count());
-
     thread::spawn(move || {
         while let Ok((query, filepath, reply_tx)) = rx.recv() {
-            println!("ArrowTiles Worker: Executing inner query...");
             let result = execute_export(&conn, &query, &filepath);
             let _ = reply_tx.send(result);
         }
