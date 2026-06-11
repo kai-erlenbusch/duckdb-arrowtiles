@@ -1,7 +1,7 @@
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use duckdb::{Connection, Result, core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId}};
 use duckdb::vscalar::arrow::{VArrowScalar, ArrowFunctionSignature};
-use arrow::array::{Array, RecordBatch, Float64Array, UInt64Array};
+use arrow::array::{Array, RecordBatch, Float64Array, UInt64Array, UInt8Array};
 use arrow::datatypes::DataType;
 use arrow::ipc::writer::FileWriter;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,25 +105,31 @@ impl VArrowScalar for HilbertScalar {
     fn invoke(_: &Self::State, input: RecordBatch) -> std::result::Result<Arc<dyn Array>, Box<dyn Error>> {
         let lon_array = input.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
         let lat_array = input.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let zoom_array = input.column(2).as_any().downcast_ref::<UInt8Array>().unwrap();
 
-        // For now, simple mock Tile ID computation based on lon/lat to unblock compilation
-        // We will integrate exact fast_hilbert/PMTiles math once API is verified
-        let mut tile_ids = Vec::with_capacity(lon_array.len());
-        for i in 0..lon_array.len() {
-            let lon = lon_array.value(i);
-            let lat = lat_array.value(i);
-            // Example mapping logic
-            let x = ((lon + 180.0) / 360.0 * 1000000.0) as u32;
-            let y = ((lat + 90.0) / 180.0 * 1000000.0) as u32;
-            tile_ids.push((x as u64) << 32 | (y as u64));
-        }
+        let lon_iter = lon_array.iter();
+        let lat_iter = lat_array.iter();
+        let zoom_iter = zoom_array.iter();
+
+        let tile_ids: Vec<Option<u64>> = lon_iter.zip(lat_iter).zip(zoom_iter).map(|((lon_opt, lat_opt), zoom_opt)| {
+            match (lon_opt, lat_opt, zoom_opt) {
+                (Some(lon), Some(lat), Some(zoom)) => {
+                    let _z = zoom as u32; // will be used for fast_hilbert bounding box later
+                    // Example mapping logic
+                    let x = ((lon + 180.0) / 360.0 * 1000000.0) as u32;
+                    let y = ((lat + 90.0) / 180.0 * 1000000.0) as u32;
+                    Some((x as u64) << 32 | (y as u64))
+                },
+                _ => None // Properly yield NULL if any coordinate or zoom is missing
+            }
+        }).collect();
 
         Ok(Arc::new(UInt64Array::from(tile_ids)))
     }
 
     fn signatures() -> Vec<ArrowFunctionSignature> {
         vec![ArrowFunctionSignature::exact(
-            vec![DataType::Float64, DataType::Float64],
+            vec![DataType::Float64, DataType::Float64, DataType::UInt8],
             DataType::UInt64,
         )]
     }
@@ -143,7 +149,7 @@ pub unsafe fn arrowtiles_init(conn: Connection) -> Result<(), Box<dyn Error>> {
     conn.register_scalar_function::<HilbertScalar>("hilbert_xy")?;
 
     // TEST IF FUNCTION EXISTS
-    let mut stmt = conn.prepare("SELECT hilbert_xy(1.0, 2.0) as val").unwrap();
+    let mut stmt = conn.prepare("SELECT hilbert_xy(1.0, 2.0, 10::UTINYINT) as val").unwrap();
     let res = stmt.query_arrow([]).unwrap();
     println!("SUCCESS! hilbert_xy exists on init connection! Rows: {:?}", res.count());
 
