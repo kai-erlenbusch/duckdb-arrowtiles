@@ -28,7 +28,7 @@ try:
         
     res = conn.execute("""
         SELECT * FROM arrowtiles_export(
-            'SELECT *, hilbert_xy(lon, lat, 4) AS tile_id FROM spatial_data ORDER BY tile_id',
+            'SELECT *, hilbert_xy(lon, lat, 4::UTINYINT) AS tile_id FROM spatial_data ORDER BY tile_id',
             'output.pmtiles'
         )
     """).fetchall()

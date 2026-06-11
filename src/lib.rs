@@ -132,7 +132,9 @@ fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result
                     return Err(format!("Data is not sorted. Tile ID {} came after {}. You MUST use 'ORDER BY tile_id' in your query.", curr_id, last_id));
                 }
             }
-            last_tile_id = row_tile_id;
+            if row_tile_id.is_some() {
+                last_tile_id = row_tile_id;
+            }
 
             if row_tile_id != current_tile_id {
                 if i > 0 {
