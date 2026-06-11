@@ -60,10 +60,12 @@ graph TD
 - [x] **Zero-Copy Slicing**: Slices contiguous rows inside DuckDB's `RecordBatch` stream natively using Arrow's `.slice()` when the `tile_id` boundary changes.
 - [x] **Strict Safety Validation**: Hard-guards against memory shift panics (`zoom >= 32`) and enforces strictly monotonic sorting rules (`ORDER BY tile_id`). Completely skips CPU-heavy FlatBuffer serialization for skipped or `NULL` bounds.
 - [x] **Low-Level PMTiles Encapsulation**: Discarded heavy `FileWriter` operations in favor of Arrow's `IpcDataGenerator`, generating byte-perfect encoded dictionaries and message buffers strictly mapped to `.pmtiles` archive structures.
+- [x] **Deep Copy Buffer Bloat Prevention**: Natively deeply copies `.slice()` arrays via `arrow::compute::concat_batches` to prevent the slicing footgun where small tiles accidentally inherit massive IPC payloads from parent batches.
 
-## ⚠️ Known Limitations
+## ⚠️ Known Limitations & Future Work
 
-- **Temporary Tables & Uncommitted Transactions**: Because DuckDB requires Table Functions to be completely thread-safe, `arrowtiles_export` passes your query to an isolated background connection worker. This means the extension cannot currently export `TEMP` tables or data from uncommitted transactions. Please ensure you are querying physical tables or persistent views!
+- **Temporary Tables & Uncommitted Transactions**: Because DuckDB requires Table Functions to be completely thread-safe, `arrowtiles_export` passes your query to an isolated background connection worker. This means the extension cannot currently export `TEMP` tables or data from uncommitted transactions. 
+  - **Roadmap**: We are actively planning to migrate this from a `TableFunction` to a native `CopyFunction` (e.g. `COPY tbl TO 'out.pmtiles' (FORMAT 'pmtiles')`), which will stream chunks natively from the active transaction without the thread-hacking workaround!
 - **Sequential Execution**: The extension utilizes a single background worker to prevent Out-Of-Memory (OOM) crashes when attempting concurrent exports of massive geospatial datasets. Multiple concurrent `arrowtiles_export` calls will be queued and executed sequentially.
 
 ## 🛠️ Building & Loading
@@ -86,4 +88,19 @@ Open your DuckDB CLI or Python environment and load the extension:
 
 ```sql
 LOAD 'target/release/duckdb_arrowtiles.duckdb_extension';
+```
+
+### Generating Zoom Pyramids
+ArrowTiles provides a low-level, high-performance UDF for calculating tile IDs. If you want to construct a standard web-mapping pyramid (e.g., zoom levels 0 to 14) for a dataset, you can utilize DuckDB's native list unnesting to explode your geometry across the zoom ranges in a single query:
+
+```sql
+SELECT * FROM arrowtiles_export($$
+    SELECT 
+        data.*,
+        z.zoom,
+        hilbert_xy(data.lon, data.lat, z.zoom::UTINYINT) AS tile_id
+    FROM spatial_data AS data
+    CROSS JOIN UNNEST(generate_series(0, 14)) AS z(zoom)
+    ORDER BY tile_id
+$$, 'output.pmtiles');
 ```

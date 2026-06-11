@@ -80,6 +80,10 @@ impl VTab for ArrowTilesVTab {
     }
 }
 
+// TODO: Migrate to CopyFunction! 
+// This TableFunction + Background Worker is an architectural workaround.
+// The idiomatic DuckDB solution is to implement a custom CopyFunction (e.g. COPY tbl TO 'out.pmtiles' (FORMAT 'pmtiles'))
+// which natively streams DataChunks from the active transaction without breaking TEMP table scope.
 fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result::Result<usize, String> {
     let mut stmt = conn.prepare(query).map_err(|e| format!("Prepare error: {}", e))?;
     let arrow_result = stmt.query_arrow([]).map_err(|e| format!("Query arrow error: {}", e))?;
@@ -142,9 +146,13 @@ fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result
                     let run_length = i - current_run_start;
                     if run_length > 0 && current_tile_id.is_some() {
                         let sliced_batch = batch.slice(current_run_start, run_length);
+                        // Deep copy the slice to prevent massive memory buffer bloat in IPC payload!
+                        let copied_batch = arrow::compute::concat_batches(&sliced_batch.schema(), &[&sliced_batch])
+                            .map_err(|e| format!("Arrow concat error: {}", e))?;
+                            
                         let mut dictionary_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
                         let (encoded_dictionaries, encoded_message) = data_gen
-                            .encoded_batch(&sliced_batch, &mut dictionary_tracker, &write_options)
+                            .encoded_batch(&copied_batch, &mut dictionary_tracker, &write_options)
                             .map_err(|e| format!("Arrow encode error: {}", e))?;
 
                         for dict in encoded_dictionaries {
@@ -173,9 +181,13 @@ fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result
         let run_length = batch.num_rows() - current_run_start;
         if run_length > 0 && current_tile_id.is_some() {
             let sliced_batch = batch.slice(current_run_start, run_length);
+            // Deep copy the slice to prevent massive memory buffer bloat in IPC payload!
+            let copied_batch = arrow::compute::concat_batches(&sliced_batch.schema(), &[&sliced_batch])
+                .map_err(|e| format!("Arrow concat error: {}", e))?;
+                
             let mut dictionary_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
             let (encoded_dictionaries, encoded_message) = data_gen
-                .encoded_batch(&sliced_batch, &mut dictionary_tracker, &write_options)
+                .encoded_batch(&copied_batch, &mut dictionary_tracker, &write_options)
                 .map_err(|e| format!("Arrow encode error: {}", e))?;
 
             for dict in encoded_dictionaries {
