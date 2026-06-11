@@ -5,7 +5,7 @@
 
 ArrowTiles is a highly experimental, high-performance **native DuckDB extension** written in Rust. 
 
-The goal of this project is to eliminate Python and standard IPC overhead from spatial tiling workflows. By running directly inside DuckDB's C++ memory space, ArrowTiles allows data scientists to ingest massive Parquet/CSV datasets and natively export them into a single PMTiles archive filled with zero-copy Apache Arrow IPC buffers—all using a single SQL command.
+The goal of this project is to eliminate Python and standard IPC overhead from spatial tiling workflows. By running directly inside DuckDB's C++ memory space, ArrowTiles allows data scientists to ingest massive Parquet/CSV datasets and natively export them into a single PMTiles archive filled with dense Apache Arrow IPC buffers—all using a single SQL command.
 
 ## 🏗️ Architecture
 
@@ -57,7 +57,7 @@ graph TD
 ### ✅ Phase 4: PMTiles & Zero-Copy Arrow IPC (Completed)
 - [x] **Web Mercator & Fast Hilbert**: Upgraded the `hilbert_xy` UDF to clamp coordinates safely, project them to Web Mercator Tile X/Y based on the zoom level, and calculate the exact PMTiles Z-order offset.
 - [x] **Global Schema Base64 Injection**: Serializes the Arrow `Schema` into raw bytes, Base64 encodes it, and injects it into the global PMTiles JSON metadata header to avoid schema bloat in every tile.
-- [x] **Zero-Copy Slicing**: Slices contiguous rows inside DuckDB's `RecordBatch` stream natively using Arrow's `.slice()` when the `tile_id` boundary changes.
+- [x] **Zero-Copy Ingestion**: Streams `RecordBatch` instances out of DuckDB natively via the C-Data interface. *(Note: To prevent buffer bloat, tile boundaries strictly trigger an O(N) memory copy via `concat_batches` to ensure dense PMTiles archives, meaning the export is not entirely zero-copy).*
 - [x] **Strict Safety Validation**: Hard-guards against memory shift panics (`zoom >= 32`) and enforces strictly monotonic sorting rules (`ORDER BY tile_id`). Completely skips CPU-heavy FlatBuffer serialization for skipped or `NULL` bounds.
 - [x] **Low-Level PMTiles Encapsulation**: Discarded heavy `FileWriter` operations in favor of Arrow's `IpcDataGenerator`, generating byte-perfect encoded dictionaries and message buffers strictly mapped to `.pmtiles` archive structures.
 - [x] **Deep Copy Buffer Bloat Prevention**: Natively deeply copies `.slice()` arrays via `arrow::compute::concat_batches` to prevent the slicing footgun where small tiles accidentally inherit massive IPC payloads from parent batches.

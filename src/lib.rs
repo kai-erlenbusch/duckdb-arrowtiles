@@ -217,9 +217,12 @@ impl VArrowScalar for HilbertScalar {
     type State = ();
 
     fn invoke(_: &Self::State, input: RecordBatch) -> std::result::Result<Arc<dyn Array>, Box<dyn Error>> {
-        let lon_array = input.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
-        let lat_array = input.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let zoom_array = input.column(2).as_any().downcast_ref::<UInt8Array>().unwrap();
+        let lon_array = input.column(0).as_any().downcast_ref::<Float64Array>()
+            .ok_or("Failed to downcast longitude column to Float64")?;
+        let lat_array = input.column(1).as_any().downcast_ref::<Float64Array>()
+            .ok_or("Failed to downcast latitude column to Float64")?;
+        let zoom_array = input.column(2).as_any().downcast_ref::<UInt8Array>()
+            .ok_or("Failed to downcast zoom column to UInt8")?;
 
         let lon_iter = lon_array.iter();
         let lat_iter = lat_array.iter();
