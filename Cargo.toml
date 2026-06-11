@@ -9,8 +9,9 @@ name = "arrowtiles"
 crate-type = ["cdylib"]
 
 [dependencies]
+arrow = { version = "58.0.0", features = ["ipc"] }
 # We use the DuckDB Rust wrapper with extension-module enabled
-duckdb = { version = "1.0.0", features = ["duckdb-loadable-macros", "vtab-loadable"] }
+duckdb = { version = "1.0.0", features = ["duckdb-loadable-macros", "vtab-loadable", "vtab-arrow"] }
 duckdb-loadable-macros = "1.0.0"
 
 # Future dependencies for Phase 2 and 3

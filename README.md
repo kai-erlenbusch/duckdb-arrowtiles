@@ -39,10 +39,11 @@ graph TD
 - [x] Successfully compiled the `.dll` and injected DuckDB's strict cryptographic metadata footer using `cargo-duckdb-ext-tools`.
 - [x] Extension loads flawlessly in DuckDB (`LOAD 'arrowtiles'`) without IPC or Python bridging.
 
-### 🚧 Phase 2: Arrow Serialization (Up Next)
-- [ ] Hook into DuckDB's internal `DataChunk` vectors.
-- [ ] Convert DuckDB vectors into Apache Arrow `RecordBatch` instances using `arrow-rs`.
-- [ ] Serialize the batches into in-memory `.feather` (Arrow IPC) byte buffers.
+### ✅ Phase 2: Arrow Serialization (Completed)
+- [x] Hooked into DuckDB's internal vectors by creating a custom `TableFunction` (`arrowtiles_export`).
+- [x] Implemented a **Thread-Safe Channel Architecture**: Bypassed DuckDB's parallel worker thread constraints by spawning a dedicated background worker that exclusively holds the `Connection`, communicating with the `VTab` via `mpsc` channels.
+- [x] Extracted `RecordBatch` streams using DuckDB's highly optimized Arrow C-Data interface (`stmt.query_arrow([])`).
+- [x] Serialized zero-copy batches directly into an Apache Arrow IPC `.feather` output file using `arrow::ipc::writer::FileWriter`.
 
 ### 🗺️ Phase 3: Spatial Binning & PMTiles Packaging
 - [ ] Implement spatial quadtree math to determine Z/X/Y bounds for every row.
