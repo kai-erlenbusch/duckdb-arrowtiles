@@ -23,17 +23,21 @@ for row in udf_res:
 print("\nTesting ArrowTiles export with UDF sorting...")
 try:
     # We call the table function arrowtiles_export(query, filepath)
-    if os.path.exists("output.feather"):
-        os.remove("output.feather")
+    if os.path.exists("output.pmtiles"):
+        os.remove("output.pmtiles")
         
-    query = "SELECT *, hilbert_xy(lon, lat, 10::UTINYINT) as tile_id FROM spatial_data ORDER BY tile_id"
-    res = conn.execute(f"SELECT * FROM arrowtiles_export('{query}', 'output.feather')").fetchall()
-    print("Export Result:", res)
+    res = conn.execute("""
+        SELECT * FROM arrowtiles_export(
+            'SELECT *, hilbert_xy(lon, lat, 4) AS tile_id FROM spatial_data ORDER BY tile_id',
+            'output.pmtiles'
+        )
+    """).fetchall()
+    print(f"Export Result: {res}")
     
-    if os.path.exists("output.feather"):
-        size = os.path.getsize("output.feather")
-        print(f"SUCCESS! Arrow IPC file 'output.feather' generated. Size: {size} bytes")
+    if os.path.exists("output.pmtiles"):
+        size = os.path.getsize("output.pmtiles")
+        print(f"SUCCESS! PMTiles archive 'output.pmtiles' generated. Size: {size} bytes")
     else:
-        print("FAILED! output.feather was not created.")
+        print("FAILED! output.pmtiles was not created.")
 except Exception as e:
     print("Export failed:", e)

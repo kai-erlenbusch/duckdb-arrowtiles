@@ -9,6 +9,7 @@ use std::sync::{mpsc, Mutex, Arc};
 use std::error::Error;
 use std::thread;
 use std::fs::File;
+use base64::Engine;
 
 // Channel payload: (Query, Filepath, ReplySender)
 type Request = (String, String, mpsc::SyncSender<std::result::Result<usize, String>>);
@@ -84,15 +85,114 @@ fn execute_export(conn: &Connection, query: &str, filepath: &str) -> std::result
     let arrow_result = stmt.query_arrow([]).map_err(|e| format!("Query arrow error: {}", e))?;
     let schema = arrow_result.get_schema();
     
-    let file = File::create(filepath).map_err(|e| format!("File creation error: {}", e))?;
-    let mut writer = FileWriter::try_new(file, schema.as_ref()).map_err(|e| format!("Arrow writer init error: {}", e))?;
+    let file = std::fs::File::create(filepath).map_err(|e| format!("File create error: {}", e))?;
     
+    // 1. Extract Global Schema to Base64
+    let mut schema_buf = Vec::new();
+    {
+        // Write an empty IPC file to capture just the schema
+        let mut schema_writer = arrow::ipc::writer::FileWriter::try_new(&mut schema_buf, schema.as_ref()).map_err(|e| format!("Schema write error: {}", e))?;
+        schema_writer.finish().map_err(|e| format!("Schema finish error: {}", e))?;
+    }
+    let schema_base64 = base64::engine::general_purpose::STANDARD.encode(&schema_buf);
+    let metadata_json = format!(r#"{{"format": "arrow_ipc", "compression": "none", "schema_base64": "{}"}}"#, schema_base64);
+
+    let mut pmtiles_writer = pmtiles::PmTilesWriter::new(pmtiles::TileType::Unknown)
+        .metadata(&metadata_json)
+        .create(file)
+        .map_err(|e| format!("PMTiles create error: {}", e))?;
+    
+    let mut current_tile_id: Option<u64> = None;
+    let mut tile_bytes: Vec<u8> = Vec::new();
     let mut rows_exported = 0;
+    let mut last_tile_id: Option<u64> = None;
+
+    let write_options = arrow::ipc::writer::IpcWriteOptions::default();
+    let data_gen = arrow::ipc::writer::IpcDataGenerator::default();
+
     for batch in arrow_result {
-        writer.write(&batch).map_err(|e| format!("Arrow write error: {}", e))?;
+        let tile_id_col = batch.column_by_name("tile_id")
+            .ok_or("Query MUST include a 'tile_id' column for PMTiles export.")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("tile_id column must be of type UBIGINT")?;
+
+        let mut current_run_start = 0;
+
+        for i in 0..batch.num_rows() {
+            let row_tile_id = if tile_id_col.is_valid(i) {
+                Some(tile_id_col.value(i))
+            } else {
+                None
+            };
+
+            // Safety sort check
+            if let (Some(last_id), Some(curr_id)) = (last_tile_id, row_tile_id) {
+                if curr_id < last_id {
+                    return Err(format!("Data is not sorted. Tile ID {} came after {}. You MUST use 'ORDER BY tile_id' in your query.", curr_id, last_id));
+                }
+            }
+            last_tile_id = row_tile_id;
+
+            if row_tile_id != current_tile_id {
+                if i > 0 {
+                    // Slice the run from the current batch and encode it
+                    let run_length = i - current_run_start;
+                    if run_length > 0 {
+                        let sliced_batch = batch.slice(current_run_start, run_length);
+                        let mut dictionary_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
+                        let (encoded_dictionaries, encoded_message) = data_gen
+                            .encoded_batch(&sliced_batch, &mut dictionary_tracker, &write_options)
+                            .map_err(|e| format!("Arrow encode error: {}", e))?;
+
+                        for dict in encoded_dictionaries {
+                            arrow::ipc::writer::write_message(&mut tile_bytes, dict, &write_options).map_err(|e| format!("Arrow write error: {}", e))?;
+                        }
+                        arrow::ipc::writer::write_message(&mut tile_bytes, &encoded_message, &write_options).map_err(|e| format!("Arrow write error: {}", e))?;
+                    }
+                }
+                
+                // Flush the completed tile to PMTiles
+                if let Some(tid) = current_tile_id {
+                    if !tile_bytes.is_empty() {
+                        pmtiles_writer.add_raw_tile(pmtiles::TileId::new(tid).unwrap().into(), &tile_bytes).map_err(|e| format!("PMTiles write error: {}", e))?;
+                    }
+                }
+                
+                // Reset for the new tile
+                tile_bytes.clear();
+                current_run_start = i;
+            }
+
+            current_tile_id = row_tile_id;
+        }
+
+        // At the end of the batch, encode any remaining rows for the current tile
+        let run_length = batch.num_rows() - current_run_start;
+        if run_length > 0 {
+            let sliced_batch = batch.slice(current_run_start, run_length);
+            let mut dictionary_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
+            let (encoded_dictionaries, encoded_message) = data_gen
+                .encoded_batch(&sliced_batch, &mut dictionary_tracker, &write_options)
+                .map_err(|e| format!("Arrow encode error: {}", e))?;
+
+            for dict in encoded_dictionaries {
+                arrow::ipc::writer::write_message(&mut tile_bytes, dict, &write_options).map_err(|e| format!("Arrow write error: {}", e))?;
+            }
+            arrow::ipc::writer::write_message(&mut tile_bytes, &encoded_message, &write_options).map_err(|e| format!("Arrow write error: {}", e))?;
+        }
+
         rows_exported += batch.num_rows();
     }
-    writer.finish().map_err(|e| format!("Arrow finish error: {}", e))?;
+
+    // End of stream: flush the very last tile
+    if !tile_bytes.is_empty() {
+        if let Some(tid) = current_tile_id {
+            pmtiles_writer.add_raw_tile(pmtiles::TileId::new(tid).unwrap().into(), &tile_bytes).map_err(|e| format!("PMTiles write error: {}", e))?;
+        }
+    }
+    
+    pmtiles_writer.finalize().map_err(|e| format!("PMTiles finalize error: {}", e))?;
     
     Ok(rows_exported)
 }
@@ -114,11 +214,28 @@ impl VArrowScalar for HilbertScalar {
         let tile_ids: Vec<Option<u64>> = lon_iter.zip(lat_iter).zip(zoom_iter).map(|((lon_opt, lat_opt), zoom_opt)| {
             match (lon_opt, lat_opt, zoom_opt) {
                 (Some(lon), Some(lat), Some(zoom)) => {
-                    let _z = zoom as u32; // will be used for fast_hilbert bounding box later
-                    // Example mapping logic
-                    let x = ((lon + 180.0) / 360.0 * 1000000.0) as u32;
-                    let y = ((lat + 90.0) / 180.0 * 1000000.0) as u32;
-                    Some((x as u64) << 32 | (y as u64))
+                    // Safe bounds check (automatically handles NaN because NaN comparisons evaluate to false)
+                    if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+                        return None; 
+                    }
+
+                    // Cap latitude for Web Mercator
+                    let lat_clamped = lat.clamp(-85.05112878, 85.05112878);
+                    let lat_rad = lat_clamped.to_radians();
+
+                    // Calculate number of tiles across one axis at this zoom level (2^zoom)
+                    let n = (1_u32 << zoom) as f64; 
+
+                    let x = ((lon + 180.0) / 360.0 * n).floor() as u32;
+                    let y = ((1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor() as u32;
+
+                    // Compute true Hilbert curve index
+                    let h = fast_hilbert::xy2h(x, y, zoom as u8);
+                    
+                    // PMTiles z-order hierarchical offset
+                    let offset = ((1_u64 << (zoom * 2)) - 1) / 3;
+                    
+                    Some(h + offset)
                 },
                 _ => None // Properly yield NULL if any coordinate or zoom is missing
             }
