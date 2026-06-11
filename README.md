@@ -51,6 +51,11 @@ graph TD
 - [ ] Feed the Arrow IPC buffers into `pmtiles-rs` to construct the PMTiles directory structure.
 - [ ] Flush the final `.pmtiles` archive to disk.
 
+## ⚠️ Known Limitations
+
+- **Temporary Tables & Uncommitted Transactions**: Because DuckDB requires Table Functions to be completely thread-safe, `arrowtiles_export` passes your query to an isolated background connection worker. This means the extension cannot currently export `TEMP` tables or data from uncommitted transactions. Please ensure you are querying physical tables or persistent views!
+- **Sequential Execution**: The extension utilizes a single background worker to prevent Out-Of-Memory (OOM) crashes when attempting concurrent exports of massive geospatial datasets. Multiple concurrent `arrowtiles_export` calls will be queued and executed sequentially.
+
 ## 🛠️ Building & Loading
 
 ### Prerequisites
