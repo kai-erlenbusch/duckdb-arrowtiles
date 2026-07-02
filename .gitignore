@@ -1,3 +1,7 @@
-/target
-**/*.rs.bk
-Cargo.lock
+output.feather
+output.pmtiles
+test_cache_clear.py
+commit_msg.txt
+target/
+*.duckdb
+*.parquet
