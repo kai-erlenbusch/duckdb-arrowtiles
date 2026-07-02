@@ -116,8 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let local_x = scaled_x - (ix as f64);
                 let local_y = scaled_y - (iy as f64);
                 
-                x_u16_builder.append_value((local_x * 65535.0) as u16);
-                y_u16_builder.append_value((local_y * 65535.0) as u16);
+                x_u16_builder.append_value((local_x * 65535.0).round().clamp(0.0, 65535.0) as u16);
+                y_u16_builder.append_value((local_y * 65535.0).round().clamp(0.0, 65535.0) as u16);
                 
                 let h = fast_hilbert::xy2h(ix, iy, assigned_z);
                 let offset = ((1_u64 << (assigned_z * 2)) - 1) / 3;
