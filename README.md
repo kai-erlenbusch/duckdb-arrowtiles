@@ -9,7 +9,7 @@ ArrowTiles is a high-performance data engineering pipeline designed to process m
 Because statically compiling a DuckDB extension via Rust on Windows can cause MSVC standard library conflicts, this pipeline uses a decoupled **Python + Rust IPC (Inter-Process Communication)** architecture. Python orchestrates DuckDB's out-of-core sorting engine, while a dedicated Rust binary handles CPU-intensive spatial math and parallel Zstandard compression.
 
 ## 🚀 Performance
-The 2-pass IPC architecture completely bypasses FFI (Foreign Function Interface) memory leaks and maximizes CPU utilization. It is capable of processing **1.35 billion rows (~25 GB raw Parquet)** on consumer hardware (64GB RAM, 24-core CPU) in approximately **50 minutes**, yielding a tightly compressed 15.8 GB `.arrowtiles` archive optimized for WebGPU HTTP Range Requests.
+The 2-pass IPC architecture completely bypasses FFI (Foreign Function Interface) memory leaks and maximizes CPU utilization. It is capable of processing **1.35 billion rows** on consumer hardware (64GB RAM, 24-core CPU) in **1 hour and 17 minutes**, yielding a tightly compressed 29.5 GB `.arrowtiles` archive optimized for WebGPU HTTP Range Requests.
 
 ### European Space Agency GAIA v3 Benchmarks
 Here are the actual hardware metrics captured during the build of the 1.8 billion row Gaia v3 dataset:
