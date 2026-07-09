@@ -14,11 +14,14 @@ The 2-pass IPC architecture completely bypasses FFI (Foreign Function Interface)
 ### European Space Agency GAIA v3 Benchmarks
 Here are the actual hardware metrics captured during the build of the 1.8 billion row Gaia v3 dataset:
 
-![Gaia Benchmark 1](./assets/gaia_benchmark_1.png)
+![Gaia Benchmark 3](./assets/gaia_benchmark_3.png)
 
 ![Gaia Benchmark 2](./assets/gaia_benchmark_2.png)
 
-![Gaia Benchmark 3](./assets/gaia_benchmark_3.png)
+![Gaia Benchmark 1](./assets/gaia_benchmark_1.png)
+
+
+
 
 ## 🏗️ The 2-Pass Architecture
 
