@@ -1,7 +1,20 @@
-output.feather
-output.pmtiles
-test_cache_clear.py
-commit_msg.txt
+# Rust and Cargo
 target/
-*.duckdb
+Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# DuckLake Data Files
+duckdb_temp/
+*.arrowtiles
 *.parquet
+*.feather
+*.pmtiles
+
+# Ide and OS
+.vscode/
+.idea/
+.DS_Store

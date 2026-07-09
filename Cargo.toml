@@ -1,29 +1,5 @@
-[package]
-name = "arrowtiles"
-version = "0.1.0"
-edition = "2021"
-description = "A DuckDB extension to export spatial data to PMTiles Arrow archives"
-
-[lib]
-name = "arrowtiles"
-crate-type = ["cdylib"]
-
-[dependencies]
-arrow = { version = "58.0.0" }
-# We use the DuckDB Rust wrapper with extension-module enabled
-duckdb = { version = "1.0.0", features = ["duckdb-loadable-macros", "vtab-loadable", "vtab-arrow", "vscalar", "vscalar-arrow"] }
-duckdb-loadable-macros = "1.0.0"
-fast_hilbert = "2.1.0"
-dashmap = "5.5.3"
-lazy_static = "1.4.0"
-parquet = "58.0.0"
-pmtiles = { version = "0.23.0", features = ["write", "zstd"] }
-ahash = "0.8.11"
-
-[[bin]]
-name = "arrowtiles_packer"
-path = "src/bin/packer.rs"
-
-[[bin]]
-name = "arrowtiles_bucketer"
-path = "src/bin/bucketer.rs"
+[workspace]
+resolver = "2"
+members = [
+    "arrowtiles-engine"
+]

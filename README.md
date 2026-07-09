@@ -1,94 +1,143 @@
-# ArrowTiles Toolkit (DuckDB Extension + Rust CLI)
+# ArrowTiles Pipeline (DuckDB + Rust IPC)
 
-[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.3-orange.svg)](https://duckdb.org)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v1.0.0+-orange.svg)](https://duckdb.org)
 [![Rust](https://img.shields.io/badge/Rust-1.80+-blue.svg)](https://www.rust-lang.org/)
+[![Python](https://img.shields.io/badge/Python-3.10+-yellow.svg)](https://www.python.org/)
 
-ArrowTiles is a high-performance toolkit written in Rust for processing massive spatial datasets and packing them into Apache Arrow IPC-encoded PMTiles archives.
+ArrowTiles is a high-performance data engineering pipeline designed to process massive, out-of-core spatial datasets (like the 1.8 billion row ESA Gaia dataset) and pack them into strictly ordered, Apache Arrow IPC-encoded `.arrowtiles` (PMTiles) archives.
 
-It consists of two main components:
-1. **Native DuckDB Extension:** Blazingly fast, SIMD-accelerated scalar UDFs (like Hilbert Curve generation) that evaluate across billions of rows in DuckDB with zero serialization overhead.
-2. **Rust CLI Tools:** Standalone binaries (`arrowtiles_bucketer` and `arrowtiles_packer`) that handle out-of-core spatial voxel bucketing and PMTiles archive generation.
+Because statically compiling a DuckDB extension via Rust on Windows can cause MSVC standard library conflicts, this pipeline uses a decoupled **Python + Rust IPC (Inter-Process Communication)** architecture. Python orchestrates DuckDB's out-of-core sorting engine, while a dedicated Rust binary handles CPU-intensive spatial math and parallel Zstandard compression.
 
-## 🏗️ Architecture
+## 🚀 Performance
+The 2-pass IPC architecture completely bypasses FFI (Foreign Function Interface) memory leaks and maximizes CPU utilization. It is capable of processing **1.35 billion rows (~25 GB raw Parquet)** on consumer hardware (64GB RAM, 24-core CPU) in approximately **50 minutes**, yielding a tightly compressed 15.8 GB `.arrowtiles` archive optimized for WebGPU HTTP Range Requests.
 
-The ArrowTiles pipeline is designed to process data much larger than RAM by leveraging DuckDB for sorting, and highly optimized Rust streams for bucketing and packaging.
+### European Space Agency GAIA v3 Benchmarks
+Here are the actual hardware metrics captured during the build of the 1.8 billion row Gaia v3 dataset:
+
+![Gaia Benchmark 1](./assets/gaia_benchmark_1.png)
+
+![Gaia Benchmark 2](./assets/gaia_benchmark_2.png)
+
+![Gaia Benchmark 3](./assets/gaia_benchmark_3.png)
+
+## 🏗️ The 2-Pass Architecture
+
+To prevent out-of-memory (OOM) crashes and preserve 60 FPS rendering in the frontend browser, the pipeline strictly separates spatial indexing from chunk compression:
 
 ```mermaid
 graph TD
-    A[(Raw Parquet)] -->|SQL Sort & Filter| B(DuckDB C++ Engine)
+    A[(Raw Parquet)] -->|Global Sort by Magnitude| DDB1(Python + DuckDB)
     
-    subgraph "ArrowTiles Extension (DuckDB)"
-        B -->|SIMD Invoke| UDF[hilbert_normalized / hilbert_xy]
-        UDF -->|Zero-Copy| B
+    subgraph "Pass 1: Bucketing"
+        DDB1 -->|IPC Stream| RUST1[Rust Engine: Assign Z-Levels & Hilbert]
+        RUST1 -->|IPC Stream| DDB1
+        DDB1 -->|Export| TEMP[(Temporary Parquet)]
     end
     
-    B -->|Export| C[(Sorted Parquet)]
-    
-    subgraph "Rust CLI Tools"
-        C -->|Voxel Grouping| BUCKET[arrowtiles_bucketer]
-        BUCKET -->|Assigned Z-Levels| D[(Bucketed Parquet)]
-        D -->|DuckDB Global Sort| E[(Final Ordered Parquet)]
-        E -->|IPC Serialization| PACK[arrowtiles_packer]
+    subgraph "Pass 2: Packing"
+        TEMP -->|Global Sort by Spatial Index| DDB2(Python + DuckDB)
+        DDB2 -->|IPC Stream| RUST2[Rust Engine: Zstd Compress & Pack]
     end
     
-    PACK --> S3[(.pmtiles Archive)]
+    RUST2 --> S3[(.arrowtiles Archive)]
 ```
 
-## 🚀 The CLI Tools
+### Pass 1: Global Magnitude Bucketing
+1. DuckDB reads the raw dataset and sorts it globally by absolute magnitude (brightness) in ascending order.
+2. The ordered rows are piped to the Rust engine, which uses a density map to assign a Quadtree Z-level and a spatial Hilbert index to each point.
+3. The enriched rows are streamed back to DuckDB and saved as a temporary Parquet file (`duckdb_temp/bucketed_temp.parquet`).
 
-In addition to the DuckDB extension, building this project yields two CLI executables in `target/release/`:
+### Pass 2: Spatial IPC Packing
+1. DuckDB reads the temporary Parquet file and sorts it globally by `Z-Level` and `Hilbert Index`.
+2. The perfectly ordered spatial data is piped to the Rust engine.
+3. Rust strips the redundant Arrow IPC schema headers (saving ~12% archive size), parallelizes Zstd compression across all CPU cores using Rayon, and limits chunks to 500k rows to prevent client-side memory spikes.
+4. Rust injects the base64-encoded Arrow schema into the final PMTiles JSON metadata.
 
-### 1. `arrowtiles_bucketer`
-Reads a raw spatial Parquet file, groups points into spatial voxels based on a grid size, and resolves the hierarchical Quadtree Z-level for each point to prevent visual overcrowding.
-**Usage:** `arrowtiles_bucketer <input.parquet> <output.parquet> <grid_size> <max_zoom>`
+---
 
-### 2. `arrowtiles_packer`
-Reads a Parquet file strictly ordered by `final_tile_id`, serializes the chunks into Apache Arrow IPC format, compresses them with Zstd, and writes a compliant `.pmtiles` archive.
-**Usage:** `arrowtiles_packer <input_sorted.parquet> <output.pmtiles>`
+## 🛠️ Building & Setup
 
-## 🛠️ Building & Loading
+### 1. Prerequisites
+- **Python 3.10+**
+- **Rust Toolchain** (cargo)
+- **DuckDB CLI** (or Python package)
 
-### Prerequisites
-* Rust toolchain (cargo)
-* `cargo-duckdb-ext-tools`
+### 2. Python Environment
+Install the required python orchestration dependencies (`pyarrow`, `duckdb`, `tqdm`):
+```bash
+pip install -r requirements.txt
+```
+
+### 3. DuckDB Extensions
+This pipeline relies on the community `lindel` extension for Hilbert curve generation. You can install it directly inside your DuckDB environment:
+```sql
+INSTALL lindel FROM community;
+LOAD lindel;
+```
+
+### 4. Build the Rust Engine
+Compile the highly optimized Rust ArrowTiles engine. **You must compile in release mode** to achieve acceptable throughput:
+```bash
+cd arrowtiles-engine
+cargo build --release
+```
+*(The Python script expects the compiled binary to be located at `target/release/arrowtiles_engine.exe`)*
+
+---
+
+## ⚙️ Usage & Configuration
+
+Once the Rust binary is compiled, you execute the Python orchestrator to begin the 2-pass build process:
 
 ```bash
-# Install the extension packaging tool
-cargo install cargo-duckdb-ext-tools
-
-# Build the DuckDB extension and the CLI binaries
-cargo duckdb-ext build -- --release
+python arrowtiles.py --input "path/to/raw/*.parquet" --output "gaia.arrowtiles"
 ```
 
-### Usage
+### CLI Arguments
+| Argument | Description |
+| :--- | :--- |
+| `--input` | (Required) Glob path to the input Parquet files. |
+| `--output` | (Required) Path where the final `.arrowtiles` archive will be written. |
+| `--resume` | (Optional) Skips Pass 1 and resumes directly from the `bucketed_temp.parquet` file if it exists. Useful if Pass 2 crashed previously. |
 
-Open your DuckDB CLI or Python environment and load the extension:
+### Input Data Requirements
+By default, the `arrowtiles.py` script is hardcoded to project the ESA Gaia dataset into Galactic coordinates using a Hammer projection. It expects the input Parquet files to contain at minimum:
+- `ra`, `dec` (Right Ascension / Declination)
+- `magnitude` (Absolute brightness, used for LOD sorting)
+- *Additional astronomical columns (parallax, pmra, pmdec, radial_velocity)*
+
+If you are modifying the pipeline for a different dataset, simply update the SQL query inside `ArrowTilesBuilder.build()` to return standard normalized `x_norm` (FLOAT 0-1), `y_norm` (FLOAT 0-1), and `abs_m` (FLOAT).
+
+---
+
+## 🗺️ Future Roadmap
+
+While the core pipeline successfully processes billion-row datasets, there are several major architectural leaps planned to transform ArrowTiles from a sandbox tool into a world-class spatial ecosystem.
+
+### Phase 1: Pipeline & Frontend Optimization
+- **Z-Level Partitioning (Zero-Wait Packing):** Currently, Pass 2 requires a 20-minute out-of-core spatial sort by DuckDB. We plan to upgrade Pass 1 to partition data into separate Parquet files based on Zoom level (`z_0.parquet`, `z_1.parquet`). This perfectly pre-sorts the Z-axis, turning Pass 2 into a series of lightning-fast, purely in-memory sorts and eliminating the disk-thrashing gap.
+- **Multi-Tile Streaming (Layering):** Packing 10 dimensions of scientific data (Velocity, Chemistry, Dust) into a single file makes the `.arrowtiles` archive extremely heavy. We will upgrade the pipeline to generate a lightweight "Core Layer" (XYZ coordinates only) alongside independent "Auxiliary Layers". The frontend WebWorker will fetch active layers concurrently and merge them just-in-time before GPU upload, drastically reducing bandwidth and allowing users to dynamically toggle datasets.
+
+### Phase 2: Open-Source Ecosystem Wrappers
+To make the pipeline accessible to the broader data science and web development communities, we plan to wrap the unified Rust engine using industry-standard FFI bindings:
+- **Python (PyO3 + Maturin):** Publish to PyPI so astrophysicists and data scientists can generate tiles directly in Jupyter Notebooks without installing Rust: `arrowtiles.build_lake("s3://esa-gaia", "output.arrowtiles")`.
+- **Node.js CLI (NAPI-RS):** Publish to NPM so web developers can quickly generate test tiles for WebGPU frontends using a simple terminal command: `npx arrowtiles build <input> <output>`.
+
+### Phase 3: The C++ DuckDB Extension
+Once the byte-offset logic, Quadtree math, and schema-stripping algorithms are mathematically perfected and proven in safe Rust, the ultimate goal is to port the logic to C++. By building a native loadable DuckDB extension, anyone in the world will be able to generate WebGPU-ready tiles using standard SQL:
 
 ```sql
-LOAD 'target/release/arrowtiles.duckdb_extension';
+INSTALL arrowtiles;
+LOAD arrowtiles;
+COPY (
+    SELECT ra, dec, parallax, phot_g_mean_mag 
+    FROM 's3://esa-gaia/**/*.parquet'
+) TO 'gaia.arrowtiles' (FORMAT ARROWTILES, MAX_CAPACITY 100000);
 ```
 
-### Available UDFs
+---
 
-#### 1. `hilbert_normalized(x_norm, y_norm, zoom)`
-Generates a standard Hilbert Curve index (PMTiles Z-order compatible) from pre-normalized coordinates.
+## 📄 Licensing
+This project is freely available for non-commercial use under the **Creative Commons Attribution Non Commercial CC BY-NC 4.0** public license. Please note that this license does not permit commercial use of the software. For more information about the limitations of this license, you can refer to the [CC BY-NC 4.0 License Deed](https://creativecommons.org/licenses/by-nc/4.0/).
 
-> [!WARNING]
-> **Strict Typing Required:** DuckDB's exact-match signature resolution requires the input coordinates to be strictly typed as `DOUBLE` (Float64) and zoom as `UTINYINT`.
-
-```sql
-SELECT 
-    data.*,
-    hilbert_normalized(data.x_norm::DOUBLE, data.y_norm::DOUBLE, 14::UTINYINT) AS tile_id
-FROM spatial_data AS data
-```
-
-#### 2. `hilbert_xy(lon, lat, zoom)`
-Projects raw WGS84 Longitude/Latitude coordinates into Web Mercator space and generates the corresponding Hilbert Curve index.
-
-```sql
-SELECT 
-    data.*,
-    hilbert_xy(data.lon::DOUBLE, data.lat::DOUBLE, 14::UTINYINT) AS tile_id
-FROM spatial_data AS data
-```
+If you’re planning to use this software commercially, please reach out to us for a Business license.

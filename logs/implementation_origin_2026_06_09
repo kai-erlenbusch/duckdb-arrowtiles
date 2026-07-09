@@ -1,0 +1,50 @@
+ArrowTiles (Rust-based DuckDB Extension) Implementation Plan
+Building ArrowTiles as a native Rust-based DuckDB extension is a brilliant move. We will leverage duckdb-rs (with its extension framework), arrow-rs, and pmtiles-rs.
+
+Here is the proposed organizational structure and phased implementation plan for the project.
+
+📁 Proposed Project Structure
+We should initialize a standard Cargo project (e.g., duckdb-arrowtiles) with a structure specifically tailored for a DuckDB extension.
+
+text
+
+duckdb-arrowtiles/
+├── Cargo.toml                # Rust dependencies (duckdb, arrow, pmtiles, fast_hilbert)
+├── Makefile                  # Build scripts for compiling the .duckdb_extension binary
+├── .cargo/
+│   └── config.toml           # Required rustc flags for building dynamically loaded C-libraries (cdylib)
+├── src/
+│   ├── lib.rs                # The #[duckdb_extension] entrypoint & SQL function registration
+│   ├── arrow_utils.rs        # Logic to map DuckDB DataChunks -> Apache Arrow IPC buffers
+│   ├── quadtree.rs           # Spatial math: Bounding boxes, Z/X/Y calculation, & Hilbert mapping
+│   └── pmtiles_writer.rs     # Wrapper around `pmtiles-rs` to append Arrow buffers to the archive
+├── sql/
+│   └── example.sql           # Test queries: LOAD 'arrowtiles.duckdb_extension'; COPY ...
+└── tests/
+    └── integration_test.rs   # Rust integration tests using DuckDB in-memory database
+🛠️ Phase 1: Extension Skeleton & DuckDB Interop
+The first goal is simply to get DuckDB to recognize the Rust extension and successfully extract data from a SQL query.
+
+Cargo Setup: Define the project as a cdylib (C dynamic library) so DuckDB can load it at runtime. Add duckdb-rs with the buildtime_bindgen and extension features.
+The Entrypoint: Implement the #[duckdb_entrypoint] macro in lib.rs to register a custom Table Function or COPY handler (e.g., COPY ... TO 'out.pmtiles' (FORMAT ARROWTILES)).
+Data Extraction: Write the function that accepts DuckDB's internal DataChunks and simply prints the row count to the console.
+IMPORTANT
+
+User Review Required: Do you want the SQL API to act as a custom COPY function (COPY my_table TO 'out.pmtiles' (FORMAT ARROWTILES)), or as a Table Function (SELECT build_arrowtiles('my_table', 'out.pmtiles'))? A custom COPY function is the idiomatic DuckDB way.
+
+🧮 Phase 2: Arrow Serialization
+Once we have access to the DuckDB DataChunks, we need to convert them into Arrow IPC byte buffers.
+
+DuckDB to Arrow: Use the arrow crate to convert the DuckDB DataChunk vectors into an Arrow RecordBatch.
+IPC Writer: Use arrow_ipc::writer::FileWriter to serialize the RecordBatch into an in-memory byte vector (Vec<u8>). This byte vector is exactly what a .feather file looks like.
+🗺️ Phase 3: Spatial Binning & PMTiles Packaging
+This is where the magic happens. We integrate pmtiles-rs to package the Arrow buffers.
+
+Spatial Binning: Calculate the overall spatial bounds of the dataset. For each row, calculate its Quadtree Z/X/Y coordinate, and convert that to a PMTiles Hilbert TileId using the fast_hilbert crate.
+PMTiles Writer: Instantiate PmTilesWriter::new(TileType::Unknown).
+Write Loop: For each spatial bin (tile), run the Phase 2 Arrow serialization, and pass the resulting Vec<u8> to pmtiles_writer.add_raw_tile(tile_id, byte_buffer).
+Finalize: Call finalize() on the PMTiles writer to flush the Root Directory and header to disk.
+❓ Open Questions
+Platform: Are you currently building/testing on Windows (like the Cosmograph extension), or are we targeting WSL/Linux for the initial Rust build?
+SQL Interface: As noted above, do you prefer a COPY syntax or a SELECT function syntax for the extension?
+Where to initialize: Should I go ahead and run cargo new --lib duckdb-arrowtiles inside your D:\exploratory\duckdb-extension\ directory to scaffold the files?
