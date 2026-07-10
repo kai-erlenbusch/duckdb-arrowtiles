@@ -1,6 +1,6 @@
 import duckdb
 import pyarrow as pa
-import subprocess
+
 import os
 import time
 import math
@@ -27,9 +27,9 @@ class ArrowTilesBuilder:
         return f"{s}s"
 
     def get_engine_path(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        exe = "arrowtiles_engine.exe" if os.name == 'nt' else "arrowtiles_engine"
-        return os.path.join(base_dir, "target", "release", exe)
+        # We no longer use a standalone binary, but we keep this method interface 
+        # in case we want to return the package path or version in the future.
+        return "NATIVE_PYO3"
 
     def build(self, input_query: str, output_path: str, sort_col: str = "abs_m", x_col: str = "x_norm", y_col: str = "y_norm", sort_dir: str = "ASC", max_capacity: int = 100000, max_zoom: int = 14, resume: bool = False):
         """
@@ -45,9 +45,10 @@ class ArrowTilesBuilder:
         grid_size = 1 << int(math.ceil(math.log2(math.sqrt(max_capacity))))
         print(f"Target capacity {max_capacity} -> Grid Size {grid_size}x{grid_size}", flush=True)
         
-        engine_path = self.get_engine_path()
-        if not os.path.exists(engine_path):
-            raise FileNotFoundError(f"Rust Engine not found at {engine_path}. Run `cargo build --release` first.")
+        try:
+            import arrowtiles_core
+        except ImportError:
+            raise ImportError("Native engine not found. Run `maturin build --release` and `pip install` the resulting wheel.")
 
         temp_partition_dir = os.path.join(self.temp_dir, "partitions")
         os.makedirs(temp_partition_dir, exist_ok=True)
@@ -55,6 +56,7 @@ class ArrowTilesBuilder:
         # ==========================================
         # PASS 1: DuckDB -> Rust Bucketer
         # ==========================================
+        import arrowtiles_core
         import glob
         existing_partitions = glob.glob(os.path.join(temp_partition_dir, "z_*.parquet"))
         if resume and len(existing_partitions) > 0:
@@ -76,25 +78,23 @@ class ArrowTilesBuilder:
             """
             reader_pass1 = self.con.execute(query_pass1).to_arrow_reader(100000)
             
-            process1 = subprocess.Popen(
-                [engine_path, "--bucketer", temp_partition_dir, str(grid_size), str(max_zoom), "--x-col", x_col, "--y-col", y_col],
-                stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            import pyarrow.cffi as pc
+            
+            # Export the PyArrow stream to C so Rust can safely read it without holding the GIL
+            c_stream_pass1 = pc.ffi.new("struct ArrowArrayStream*")
+            ptr_pass1 = int(pc.ffi.cast("uintptr_t", c_stream_pass1))
+            reader_pass1._export_to_c(ptr_pass1)
+            
+            # Call Rust engine natively in Python via PyO3!
+            arrowtiles_core.run_bucketer(
+                ptr_pass1,
+                temp_partition_dir,
+                float(grid_size),
+                int(max_zoom),
+                x_col,
+                y_col
             )
             
-            with process1.stdin:
-                writer = pa.ipc.new_stream(process1.stdin, reader_pass1.schema)
-                with tqdm(total=total_rows, desc="Pass 1: Bucketing", unit="rows") as pbar:
-                    for batch in reader_pass1:
-                        writer.write_batch(batch)
-                        pbar.update(batch.num_rows)
-                writer.close()
-                
-            process1.wait()
-            if process1.returncode != 0:
-                err_msg = process1.stderr.read().decode('utf-8') if process1.stderr else ""
-                raise RuntimeError(f"Pass 1: Rust Bucketer failed!\n{err_msg}")
-                
             print(f"\n[OK] Pass 1 completed in {self.format_time(time.time() - t_pass1)}", flush=True)
 
         # ==========================================
@@ -114,38 +114,46 @@ class ArrowTilesBuilder:
                 
         partitions = sorted(glob.glob(os.path.join(temp_partition_dir, "z_*.parquet")), key=get_z)
         
-        process2 = subprocess.Popen(
-            [engine_path, "--packer", output_path],
-            stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        import pyarrow.cffi as pc
         
-        with process2.stdin:
-            writer = None
-            with tqdm(total=total_rows, desc="Pass 2: Packing", unit="rows") as pbar:
-                for part in partitions:
-                    query_pass2 = f"""
-                        SELECT * 
-                        FROM read_parquet('{part}')
-                        ORDER BY final_tile_id ASC
-                    """
-                    reader_pass2 = self.con.execute(query_pass2).to_arrow_reader(100000)
-                    
-                    if writer is None:
-                        writer = pa.ipc.new_stream(process2.stdin, reader_pass2.schema)
-                        
-                    for batch in reader_pass2:
-                        writer.write_batch(batch)
-                        pbar.update(batch.num_rows)
+        # Instantiate the Stateful PyO3 Rust Class.
+        # We must provide the schema for the final output, which we can get by 
+        # extracting it from the first partition if available.
+        # Wait, the Rust `ArrowTilesPacker` expects a stream pointer in `new()` just to read the schema!
+        # We can construct a dummy reader from an empty table just to pass the schema.
+        
+        # Let's peek the schema from the first partition to initialize the packer.
+        if not partitions:
+            print("No partitions found to pack!", flush=True)
+            return
             
-            if writer is not None:
-                writer.close()
+        first_part_schema = duckdb.query(f"SELECT * FROM read_parquet('{partitions[0]}') LIMIT 0").to_arrow_table().schema
+        empty_table = pa.Table.from_arrays([pa.array([], type=t) for t in first_part_schema.types], schema=first_part_schema)
+        dummy_reader = pa.RecordBatchReader.from_batches(first_part_schema, empty_table.to_batches())
+        
+        c_schema_stream = pc.ffi.new("struct ArrowArrayStream*")
+        ptr_schema = int(pc.ffi.cast("uintptr_t", c_schema_stream))
+        dummy_reader._export_to_c(ptr_schema)
+        
+        packer = arrowtiles_core.ArrowTilesPacker(output_path, ptr_schema)
+        
+        for part in partitions:
+            query_pass2 = f"""
+                SELECT * 
+                FROM read_parquet('{part}')
+                ORDER BY final_tile_id ASC
+            """
+            reader_pass2 = self.con.execute(query_pass2).to_arrow_reader(100000)
             
-        process2.wait()
-        if process2.returncode != 0:
-            err_msg = process2.stderr.read().decode('utf-8') if process2.stderr else ""
-            raise RuntimeError(f"Pass 2: Rust Packer failed!\n{err_msg}")
+            c_stream_pass2 = pc.ffi.new("struct ArrowArrayStream*")
+            ptr_pass2 = int(pc.ffi.cast("uintptr_t", c_stream_pass2))
+            reader_pass2._export_to_c(ptr_pass2)
             
+            # Pass zero-copy stream to Rust natively!
+            packer.process_batch(ptr_pass2)
+            
+        packer.finalize()
+        
         print(f"\n[OK] Pass 2 completed in {self.format_time(time.time() - t_pass2)}", flush=True)
         
         # Cleanup
