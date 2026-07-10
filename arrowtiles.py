@@ -78,7 +78,8 @@ class ArrowTilesBuilder:
             
             process1 = subprocess.Popen(
                 [engine_path, "--bucketer", temp_partition_dir, str(grid_size), str(max_zoom), "--x-col", x_col, "--y-col", y_col],
-                stdin=subprocess.PIPE
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
             
             with process1.stdin:
@@ -91,7 +92,8 @@ class ArrowTilesBuilder:
                 
             process1.wait()
             if process1.returncode != 0:
-                raise RuntimeError("Pass 1: Rust Bucketer failed!")
+                err_msg = process1.stderr.read().decode('utf-8') if process1.stderr else ""
+                raise RuntimeError(f"Pass 1: Rust Bucketer failed!\n{err_msg}")
                 
             print(f"\n[OK] Pass 1 completed in {self.format_time(time.time() - t_pass1)}", flush=True)
 
@@ -114,7 +116,8 @@ class ArrowTilesBuilder:
         
         process2 = subprocess.Popen(
             [engine_path, "--packer", output_path],
-            stdin=subprocess.PIPE
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
         
         with process2.stdin:
@@ -140,7 +143,8 @@ class ArrowTilesBuilder:
             
         process2.wait()
         if process2.returncode != 0:
-            raise RuntimeError("Pass 2: Rust Packer failed!")
+            err_msg = process2.stderr.read().decode('utf-8') if process2.stderr else ""
+            raise RuntimeError(f"Pass 2: Rust Packer failed!\n{err_msg}")
             
         print(f"\n[OK] Pass 2 completed in {self.format_time(time.time() - t_pass2)}", flush=True)
         
@@ -149,7 +153,7 @@ class ArrowTilesBuilder:
             import shutil
             shutil.rmtree(temp_partition_dir)
         except OSError:
-            pass
+            print(f"WARNING: Could not delete temp dir. Please manually delete {temp_partition_dir}", flush=True)
             
         print(f"\n--- Pipeline Complete! Total Time: {self.format_time(time.time() - t_global)} ---", flush=True)
         if os.path.exists(output_path):
@@ -183,6 +187,7 @@ def build_gaia(input_parquet: str, output_path: str, resume: bool = False, memor
         ),
         wrapped AS (
             SELECT *, ((l_rad_raw + 5*PI()) % (2*PI())) - PI() AS l_rad FROM galactic
+            WHERE ra IS NOT NULL AND dec IS NOT NULL
         )
         SELECT 
             CAST(( ( -2 * sqrt(2) * cos(b_rad) * sin(l_rad / 2) ) / sqrt(1 + cos(b_rad) * cos(l_rad / 2)) + 2.8284271247461903 ) / 5.6568542494923806 AS FLOAT) AS x_norm,

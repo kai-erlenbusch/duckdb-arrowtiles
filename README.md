@@ -80,6 +80,8 @@ cargo build --release
 
 Once the Rust binary is compiled, you execute the Python orchestrator to begin the 2-pass build process:
 
+> ⚠️ **Memory Warning**: Processing the 1.8 billion row Gaia dataset requires ~15GB of available RAM during Pass 1 for the Quadtree HashSet collision tracking. Ensure your system meets this requirement before running the full dataset.
+
 ```bash
 python arrowtiles.py --input "path/to/raw/*.parquet" --output "gaia.arrowtiles"
 ```

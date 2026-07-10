@@ -51,6 +51,8 @@ fn run_bucketer(
     let output_schema = Arc::new(Schema::new(out_fields));
 
     let mut writers: HashMap<u8, ArrowWriter<File>> = HashMap::new();
+    let mut z_buffers: HashMap<u8, Vec<RecordBatch>> = HashMap::new();
+    let mut z_buffer_rows: HashMap<u8, usize> = HashMap::new();
     let mut occupied: AHashSet<u64> = AHashSet::with_capacity(5_000_000);
 
     let mut row_count = 0;
@@ -180,7 +182,32 @@ fn run_bucketer(
             }
             let filtered_batch = RecordBatch::try_new(output_schema.clone(), filtered_cols)?;
             
-            // Get or insert writer
+            let buffer = z_buffers.entry(z).or_insert_with(Vec::new);
+            let rows = z_buffer_rows.entry(z).or_insert(0);
+            
+            *rows += filtered_batch.num_rows();
+            buffer.push(filtered_batch);
+            
+            if *rows >= 100_000 {
+                let single_batch = arrow::compute::concat_batches(&output_schema, buffer.as_slice())?;
+                let writer = writers.entry(z).or_insert_with(|| {
+                    let path = format!("{}/z_{}.parquet", output_dir, z);
+                    let file = File::create(path).unwrap();
+                    let props = WriterProperties::builder()
+                        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                        .build();
+                    ArrowWriter::try_new(file, output_schema.clone(), Some(props)).unwrap()
+                });
+                writer.write(&single_batch)?;
+                buffer.clear();
+                *rows = 0;
+            }
+        }
+    }
+
+    for (z, buffer) in z_buffers.into_iter() {
+        if !buffer.is_empty() {
+            let single_batch = arrow::compute::concat_batches(&output_schema, &buffer)?;
             let writer = writers.entry(z).or_insert_with(|| {
                 let path = format!("{}/z_{}.parquet", output_dir, z);
                 let file = File::create(path).unwrap();
@@ -189,7 +216,7 @@ fn run_bucketer(
                     .build();
                 ArrowWriter::try_new(file, output_schema.clone(), Some(props)).unwrap()
             });
-            writer.write(&filtered_batch)?;
+            writer.write(&single_batch)?;
         }
     }
 
@@ -260,15 +287,14 @@ fn run_packer(output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     export_batches.push(RecordBatch::try_new(schema.clone(), cols)?);
                 }
 
+                let single_batch = arrow::compute::concat_batches(&schema, &export_batches)?;
                 let mut sink = Vec::new();
                 let mut stream_writer = StreamWriter::try_new_with_options(
                     &mut sink,
                     &schema,
                     IpcWriteOptions::default(),
                 )?;
-                for b in export_batches.iter() {
-                    stream_writer.write(b)?;
-                }
+                stream_writer.write(&single_batch)?;
                 stream_writer.finish()?;
                 
                 // Dynamic Schema Stripping Safety Check!
