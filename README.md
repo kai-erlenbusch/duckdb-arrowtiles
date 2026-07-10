@@ -6,6 +6,12 @@
 
 ArrowTiles is a high-performance data engineering pipeline designed to process massive, out-of-core spatial datasets (like the 1.8 billion row ESA Gaia dataset) and pack them into strictly ordered, Apache Arrow IPC-encoded `.arrowtiles` (PMTiles) archives.
 
+<div align="center">
+  <img src="assets/gaia_benchmark_1.png" width="30%" />
+  <img src="assets/gaia_benchmark_2.png" width="30%" />
+  <img src="assets/gaia_benchmark_3.png" width="30%" />
+</div>
+
 Because statically compiling a DuckDB extension via Rust on Windows can cause MSVC standard library conflicts, this pipeline uses a decoupled **Python + Rust IPC (Inter-Process Communication)** architecture. Python orchestrates DuckDB's out-of-core sorting engine, while a dedicated Rust binary handles CPU-intensive spatial math and parallel Zstandard compression.
 
 ## 🚀 Performance
