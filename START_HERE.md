@@ -1,4 +1,4 @@
-# START_HERE: The DeepGraph Philosophy (Backend Engine) 🌌
+# START_HERE: The DeepGraph Philosophy (Architecture & Philosophy) 🌌
 
 **ATTENTION AI AGENTS AND DEVELOPERS:** If you are new to this repository, read this document first. It contains the core philosophy, history, and architectural decisions that define this project. Understanding this will save you hours of context-gathering.
 
@@ -38,17 +38,17 @@ To solve these limitations, we built a modern ecosystem with a direct 1-to-1 lin
 
 The core concept is **"PMTiles for Scatterplots"**.
 
-Instead of writing thousands of files, we write a **single, unified `.pmtiles` archive**. 
+Instead of writing thousands of files, we write a **single, unified `.arrowtiles` archive**. 
 
 ### The Backend: DuckDB + Rust
 We leverage **DuckDB** for out-of-core data processing and a custom **Rust** CLI tool (`arrowtiles_bucketer`) for spatial partitioning. 
 1. **Global Sorting:** DuckDB reads the raw Parquet files and performs a global sort by magnitude (brightness), ensuring that the most significant points across the *entire dataset* are prioritized.
 2. **Spatial Voxel Bucketing:** The Rust tool reads the data streams and bins the points into a spatial quadtree, keeping them strictly ordered by brightness.
-3. **Single Archive Packing:** The quadtree chunks are written as pure Apache Arrow IPC binaries and packed into a single `.pmtiles` file.
+3. **Single Archive Packing:** The quadtree chunks are written as pure Apache Arrow IPC binaries and packed into a single `.arrowtiles` file.
 
 ### The Frontend: WebGPU & HTTP Range Requests
 Instead of WebGL, we built a modern **WebGPU** engine using Three.js.
-- **Range Requests:** The `PMTilesClient` parses the `.pmtiles` directory structure and uses **HTTP Range Requests** to fetch only the exact byte-ranges of the Arrow IPC chunks it needs directly from the single file. This is highly efficient and CDN-friendly.
+- **Range Requests:** The `PMTilesClient` parses the `.arrowtiles` directory structure and uses **HTTP Range Requests** to fetch only the exact byte-ranges of the Arrow IPC chunks it needs directly from the single file. This is highly efficient and CDN-friendly.
 - **Zero-Copy Arrays & Multithreading:** The Apache Arrow IPC chunks are decompressed (Zstd) and parsed natively into `Float32Arrays` using a multi-threaded Round-Robin Web Worker pool. These TypedArrays are then passed directly to the GPU buffers with zero overhead, keeping the Main UI thread completely unblocked.
 
 ---
@@ -73,14 +73,14 @@ We fixed this by removing the local point limit and implementing **Global Magnit
 **CRITICAL RULE FOR AI AGENTS:** This ecosystem is split into two physical sibling repositories on the filesystem. Depending on your task, you MUST navigate to the correct directory:
 
 1. **Frontend & Pipeline (`deepgraph` sandbox):**
-   - **Path:** `D:\exploratory\duckdb-extension\deepgraph-arrowtiles-sandbox`
-   - **What lives here:** The WebGPU application (`src/`), the Python pipeline coordinator (`generate_pipeline.py`), and all web assets.
+   - **Repository:** `https://github.com/kai-erlenbusch/deepgraph-arrowtiles-sandbox`
+   - **What lives here:** The WebGPU application (`src/`) and all web assets. (Strictly the web client).
    - **Caution (Agent Memory):** The `logs/` directory contains transcripts, implementation plans, research reports, and walkthroughs from past agent sessions. If you need historical context on *why* a decision was made, read the files in `logs/` before asking the user.
    - **Constraint:** Performance over everything. Do not introduce O(N) JavaScript loops over the data arrays on the main thread. Additive blending without depth testing is extremely expensive on fill rate. Keep point quad sizes small at low zooms.
 
 2. **Backend Engine (`arrowtiles`):**
-   - **Path:** `D:\exploratory\duckdb-extension\duckdb-arrowtiles`
-   - **What lives here:** The core Rust logic for spatial partitioning (`src/bin/bucketer.rs`) and Arrow IPC packing (`src/bin/packer.rs`). 
+   - **Repository:** `https://github.com/kai-erlenbusch/duckdb-arrowtiles`
+   - **What lives here:** The core Rust logic for spatial partitioning (`src/bin/bucketer.rs`), Arrow IPC packing (`src/bin/packer.rs`), and the Python pipeline coordinator (`arrowtiles.py`).
    - **Constraint:** If Stage 2 data processing needs to be modified, do it here. Do not attempt to process 24 GB of data natively in Python loops.
 
 **Handoff Protocol:** If a user asks you to review or modify `deepgraph`, you stay in the sandbox folder. If the user asks you to review or modify `arrowtiles`, you must immediately traverse to the `duckdb-arrowtiles` sibling directory before searching for files or proposing edits.

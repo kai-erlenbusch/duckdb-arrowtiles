@@ -16,9 +16,7 @@ class ArrowTilesBuilder:
             'temp_directory': temp_dir, 
             'max_memory': memory_limit
         })
-        
-        # Install and load Lindel for Hilbert curves
-        self.con.execute("INSTALL lindel FROM community; LOAD lindel;")
+        # We don't need Lindel because Rust does the Hilbert calculations!
         self.con.execute("PRAGMA max_temp_directory_size='400GB';")
 
     def format_time(self, seconds):
@@ -33,10 +31,10 @@ class ArrowTilesBuilder:
         exe = "arrowtiles_engine.exe" if os.name == 'nt' else "arrowtiles_engine"
         return os.path.join(base_dir, "target", "release", exe)
 
-    def build(self, input_query: str, output_path: str, max_capacity: int = 100000, max_zoom: int = 14, resume: bool = False):
+    def build(self, input_query: str, output_path: str, sort_col: str = "abs_m", x_col: str = "x_norm", y_col: str = "y_norm", sort_dir: str = "ASC", max_capacity: int = 100000, max_zoom: int = 14, resume: bool = False):
         """
         Executes the 2-Pass DuckLake Pipeline.
-        `input_query` must return `x_norm` (FLOAT 0-1), `y_norm` (FLOAT 0-1), and `abs_m` (FLOAT).
+        `input_query` must return `x_col` (FLOAT 0-1), `y_col` (FLOAT 0-1), and `sort_col`.
         """
         t_global = time.time()
         start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_global))
@@ -51,14 +49,17 @@ class ArrowTilesBuilder:
         if not os.path.exists(engine_path):
             raise FileNotFoundError(f"Rust Engine not found at {engine_path}. Run `cargo build --release` first.")
 
-        temp_parquet = os.path.join(self.temp_dir, "bucketed_temp.parquet")
+        temp_partition_dir = os.path.join(self.temp_dir, "partitions")
+        os.makedirs(temp_partition_dir, exist_ok=True)
         
         # ==========================================
         # PASS 1: DuckDB -> Rust Bucketer
         # ==========================================
-        if resume and os.path.exists(temp_parquet):
-            print(f"\n✅ Found existing '{temp_parquet}'. SKIPPING PASS 1!", flush=True)
-            total_rows = self.con.execute(f"SELECT COUNT(*) FROM read_parquet('{temp_parquet}')").fetchone()[0]
+        import glob
+        existing_partitions = glob.glob(os.path.join(temp_partition_dir, "z_*.parquet"))
+        if resume and len(existing_partitions) > 0:
+            print(f"\n✅ Found existing partitions in '{temp_partition_dir}'. SKIPPING PASS 1!", flush=True)
+            total_rows = self.con.execute(f"SELECT COUNT(*) FROM read_parquet('{temp_partition_dir}/z_*.parquet')").fetchone()[0]
         else:
             t_pass1 = time.time()
             print("\n[Pass 1/2] Sorting globally by Magnitude and calculating Quadtree...", flush=True)
@@ -71,13 +72,12 @@ class ArrowTilesBuilder:
             query_pass1 = f"""
                 SELECT * 
                 FROM ({input_query}) 
-                ORDER BY abs_m ASC
+                ORDER BY {sort_col} {sort_dir}
             """
-            
-            reader_pass1 = self.con.execute(query_pass1).fetch_arrow_reader(batch_size=100000)
+            reader_pass1 = self.con.execute(query_pass1).to_arrow_reader(100000)
             
             process1 = subprocess.Popen(
-                [engine_path, "--bucketer", temp_parquet, str(grid_size), str(max_zoom)],
+                [engine_path, "--bucketer", temp_partition_dir, str(grid_size), str(max_zoom), "--x-col", x_col, "--y-col", y_col],
                 stdin=subprocess.PIPE
             )
             
@@ -93,7 +93,7 @@ class ArrowTilesBuilder:
             if process1.returncode != 0:
                 raise RuntimeError("Pass 1: Rust Bucketer failed!")
                 
-            print(f"\n✅ Pass 1 completed in {self.format_time(time.time() - t_pass1)}", flush=True)
+            print(f"\n[OK] Pass 1 completed in {self.format_time(time.time() - t_pass1)}", flush=True)
 
         # ==========================================
         # PASS 2: DuckDB -> Rust Packer
@@ -101,13 +101,16 @@ class ArrowTilesBuilder:
         t_pass2 = time.time()
         print("\n[Pass 2/2] Sorting globally by Spatial Index (Z, Hilbert) and Packing...", flush=True)
         
-        query_pass2 = f"""
-            SELECT * 
-            FROM read_parquet('{temp_parquet}')
-            ORDER BY z ASC, final_tile_id ASC
-        """
         
-        reader_pass2 = self.con.execute(query_pass2).fetch_arrow_reader(batch_size=100000)
+        def get_z(f):
+            basename = os.path.basename(f)
+            # e.g. z_12.parquet -> 12
+            try:
+                return int(basename.split('_')[1].split('.')[0])
+            except (IndexError, ValueError):
+                return 0
+                
+        partitions = sorted(glob.glob(os.path.join(temp_partition_dir, "z_*.parquet")), key=get_z)
         
         process2 = subprocess.Popen(
             [engine_path, "--packer", output_path],
@@ -115,32 +118,45 @@ class ArrowTilesBuilder:
         )
         
         with process2.stdin:
-            writer = pa.ipc.new_stream(process2.stdin, reader_pass2.schema)
+            writer = None
             with tqdm(total=total_rows, desc="Pass 2: Packing", unit="rows") as pbar:
-                for batch in reader_pass2:
-                    writer.write_batch(batch)
-                    pbar.update(batch.num_rows)
-            writer.close()
+                for part in partitions:
+                    query_pass2 = f"""
+                        SELECT * 
+                        FROM read_parquet('{part}')
+                        ORDER BY final_tile_id ASC
+                    """
+                    reader_pass2 = self.con.execute(query_pass2).to_arrow_reader(100000)
+                    
+                    if writer is None:
+                        writer = pa.ipc.new_stream(process2.stdin, reader_pass2.schema)
+                        
+                    for batch in reader_pass2:
+                        writer.write_batch(batch)
+                        pbar.update(batch.num_rows)
+            
+            if writer is not None:
+                writer.close()
             
         process2.wait()
         if process2.returncode != 0:
             raise RuntimeError("Pass 2: Rust Packer failed!")
             
-        print(f"\n✅ Pass 2 completed in {self.format_time(time.time() - t_pass2)}", flush=True)
+        print(f"\n[OK] Pass 2 completed in {self.format_time(time.time() - t_pass2)}", flush=True)
         
         # Cleanup
-        if not resume: # Only delete if we didn't resume, to be safe. Or actually we want to clean it up either way if pass 2 finishes.
-            try:
-                os.remove(temp_parquet)
-            except OSError:
-                pass
+        try:
+            import shutil
+            shutil.rmtree(temp_partition_dir)
+        except OSError:
+            pass
             
         print(f"\n--- Pipeline Complete! Total Time: {self.format_time(time.time() - t_global)} ---", flush=True)
         if os.path.exists(output_path):
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             print(f"Final archive size: {size_mb:.2f} MB", flush=True)
 
-def build_gaia(input_parquet: str, output_path: str):
+def build_gaia(input_parquet: str, output_path: str, resume: bool = False, memory_limit: str = "40GB"):
     """
     Specific helper for the Gaia dataset using the Hammer projection.
     """
@@ -181,14 +197,79 @@ def build_gaia(input_parquet: str, output_path: str):
         FROM wrapped
     """
     
-    builder = ArrowTilesBuilder()
-    builder.build(input_query=gaia_query, output_path=output_path, resume=args.resume)
+    builder = ArrowTilesBuilder(memory_limit=memory_limit)
+    builder.build(input_query=gaia_query, output_path=output_path, resume=resume)
+
+def build_generic(input_parquet: str, output_path: str, x_col: str, y_col: str, sort_col: str, resume: bool = False, memory_limit: str = "40GB"):
+    """
+    Generic helper for standard spatial datasets.
+    Automatically normalizes x_col and y_col to [0, 1] bounds using DuckDB.
+    """
+    
+    # First, get the bounds to normalize the data
+    con = duckdb.connect()
+    bounds = con.execute(f"""
+        SELECT 
+            MIN({x_col}) as min_x, MAX({x_col}) as max_x,
+            MIN({y_col}) as min_y, MAX({y_col}) as max_y
+        FROM read_parquet('{input_parquet}')
+    """).fetchone()
+    
+    min_x, max_x, min_y, max_y = bounds
+    range_x = max_x - min_x
+    range_y = max_y - min_y
+    if range_x == 0: range_x = 1.0
+    if range_y == 0: range_y = 1.0
+    
+    generic_query = f"""
+        SELECT *,
+            ({x_col} - {min_x}) / {range_x} AS x_norm,
+            ({y_col} - {min_y}) / {range_y} AS y_norm
+        FROM read_parquet('{input_parquet}')
+        WHERE {x_col} IS NOT NULL AND {y_col} IS NOT NULL
+        LIMIT 10000000
+    """
+    
+    builder = ArrowTilesBuilder(memory_limit=memory_limit)
+    builder.build(
+        input_query=generic_query, 
+        output_path=output_path, 
+        sort_col=sort_col,
+        x_col='x_norm',
+        y_col='y_norm',
+        resume=resume
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ArrowTiles 2-Pass DuckLake Pipeline")
+    
+    # Core arguments
+    parser.add_argument("--dataset", type=str, choices=["gaia", "generic"], default="generic", help="Which pipeline to run.")
     parser.add_argument("--input", type=str, required=True, help="Input glob of parquet files")
     parser.add_argument("--output", type=str, required=True, help="Output .arrowtiles file")
+    
+    # Generic Schema Arguments (Only used if --dataset generic)
+    parser.add_argument("--x-col", type=str, default="x_norm", help="The column name for X coordinates (0.0 to 1.0)")
+    parser.add_argument("--y-col", type=str, default="y_norm", help="The column name for Y coordinates (0.0 to 1.0)")
+    parser.add_argument("--sort-col", type=str, default="abs_m", help="The column to globally sort by for LOD/culling")
+    
+    # System arguments
     parser.add_argument("--resume", action="store_true", help="Resume from Pass 2 if Pass 1 completed")
+    parser.add_argument("--memory-limit", type=str, default="40GB", help="DuckDB max_memory limit")
     
     args = parser.parse_args()
-    build_gaia(args.input, args.output)
+    
+    if args.dataset == "gaia":
+        print("🌌 Running ESA Gaia Pipeline...")
+        build_gaia(args.input, args.output, args.resume, args.memory_limit)
+    elif args.dataset == "generic":
+        print(f"📦 Running Generic Pipeline (X: {args.x_col}, Y: {args.y_col}, Sort: {args.sort_col})...")
+        build_generic(
+            input_parquet=args.input, 
+            output_path=args.output,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            sort_col=args.sort_col,
+            resume=args.resume,
+            memory_limit=args.memory_limit
+        )

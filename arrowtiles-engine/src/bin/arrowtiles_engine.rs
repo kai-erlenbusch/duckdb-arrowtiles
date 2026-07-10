@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::BufWriter;
@@ -7,6 +8,7 @@ use ahash::AHashSet;
 use arrow::array::{
     Array, Float32Array, RecordBatch, UInt16Builder, UInt64Array, UInt64Builder, UInt8Builder,
 };
+use arrow::compute::{cast, filter};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
@@ -19,9 +21,11 @@ use rayon::prelude::*;
 use serde_json::json;
 
 fn run_bucketer(
-    output_path: &str,
+    output_dir: &str,
     grid_size: f64,
     max_zoom: u8,
+    x_col_name: &str,
+    y_col_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let reader = StreamReader::try_new(stdin.lock(), None)?;
@@ -31,12 +35,7 @@ fn run_bucketer(
     let mut out_fields = Vec::new();
     for f in input_schema.fields() {
         let name = f.name().as_str();
-        if name != "x_norm"
-            && name != "y_norm"
-            && name != "vx_0"
-            && name != "vy_0"
-            && name != "z3_chunk_id"
-        {
+        if name != x_col_name && name != y_col_name {
             out_fields.push(f.clone());
         }
     }
@@ -51,12 +50,7 @@ fn run_bucketer(
 
     let output_schema = Arc::new(Schema::new(out_fields));
 
-    let out_file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
-        .build();
-    let mut writer = ArrowWriter::try_new(out_file, output_schema.clone(), Some(props))?;
-
+    let mut writers: HashMap<u8, ArrowWriter<File>> = HashMap::new();
     let mut occupied: AHashSet<u64> = AHashSet::with_capacity(5_000_000);
 
     let mut row_count = 0;
@@ -70,19 +64,29 @@ fn run_bucketer(
 
         row_count += num_rows;
 
-        let x_col = batch.column_by_name("x_norm").expect("x_norm missing");
-        let y_col = batch.column_by_name("y_norm").expect("y_norm missing");
+        let x_col = batch.column_by_name(x_col_name).expect(&format!("{} missing", x_col_name));
+        let y_col = batch.column_by_name(y_col_name).expect(&format!("{} missing", y_col_name));
 
-        // Sometimes Python duckdb sends FLOAT instead of DOUBLE, or vice-versa.
-        // Cast to f64 natively if possible, or expect Float32. We will enforce Float32 in python.
-        let x_arr = x_col
+        // Graceful Float64 downcasting
+        let x_cast = if x_col.data_type() == &DataType::Float64 {
+            cast(x_col, &DataType::Float32)?
+        } else {
+            x_col.clone()
+        };
+        let y_cast = if y_col.data_type() == &DataType::Float64 {
+            cast(y_col, &DataType::Float32)?
+        } else {
+            y_col.clone()
+        };
+
+        let x_arr = x_cast
             .as_any()
             .downcast_ref::<Float32Array>()
-            .expect("x_norm must be Float32");
-        let y_arr = y_col
+            .expect(&format!("{} could not be downcast to Float32", x_col_name));
+        let y_arr = y_cast
             .as_any()
             .downcast_ref::<Float32Array>()
-            .expect("y_norm must be Float32");
+            .expect(&format!("{} could not be downcast to Float32", y_col_name));
 
         let mut z_builder = UInt8Builder::with_capacity(num_rows);
         let mut tid_builder = UInt64Builder::with_capacity(num_rows);
@@ -137,11 +141,13 @@ fn run_bucketer(
             }
         }
 
+        let z_arr = Arc::new(z_builder.finish());
+        
         let mut out_columns: Vec<Arc<dyn Array>> = Vec::new();
         for f in output_schema.fields() {
             let name = f.name().as_str();
             if name == "z" {
-                out_columns.push(Arc::new(z_builder.finish()));
+                out_columns.push(z_arr.clone());
             } else if name == "final_tile_id" {
                 out_columns.push(Arc::new(tid_builder.finish()));
             } else if name == "x_u16" {
@@ -154,11 +160,43 @@ fn run_bucketer(
         }
 
         let out_batch = RecordBatch::try_new(output_schema.clone(), out_columns)?;
-        writer.write(&out_batch)?;
+        
+        // Z-level partitioning!
+        for z in 0..=max_zoom {
+            let mut z_mask_builder = arrow::array::BooleanBuilder::with_capacity(num_rows);
+            let mut has_z = false;
+            let z_arr_typed = z_arr.as_any().downcast_ref::<arrow::array::UInt8Array>().unwrap();
+            for i in 0..num_rows {
+                let is_z = z_arr_typed.value(i) == z;
+                z_mask_builder.append_value(is_z);
+                if is_z { has_z = true; }
+            }
+            if !has_z { continue; }
+            let z_mask = z_mask_builder.finish();
+            
+            let mut filtered_cols = Vec::new();
+            for col in out_batch.columns() {
+                filtered_cols.push(filter(col, &z_mask)?);
+            }
+            let filtered_batch = RecordBatch::try_new(output_schema.clone(), filtered_cols)?;
+            
+            // Get or insert writer
+            let writer = writers.entry(z).or_insert_with(|| {
+                let path = format!("{}/z_{}.parquet", output_dir, z);
+                let file = File::create(path).unwrap();
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                    .build();
+                ArrowWriter::try_new(file, output_schema.clone(), Some(props)).unwrap()
+            });
+            writer.write(&filtered_batch)?;
+        }
     }
 
-    println!("Bucketed {} rows.", row_count);
-    writer.close()?;
+    println!("Bucketed {} rows into partitions.", row_count);
+    for (_, writer) in writers {
+        writer.close()?;
+    }
     Ok(())
 }
 
@@ -210,16 +248,16 @@ fn run_packer(output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         *rows = 0;
         let schema = export_schema.clone();
 
-        let processed_tiles: Vec<(u64, Vec<u8>)> = to_process
+        let processed_tiles_res: Result<Vec<(u64, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> = to_process
             .into_par_iter()
-            .map(|(tid, batches)| {
+            .map(|(tid, batches)| -> Result<(u64, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
                 let mut export_batches = Vec::with_capacity(batches.len());
                 for b in batches.iter() {
                     let mut cols = Vec::with_capacity(schema.fields().len());
                     for f in schema.fields() {
-                        cols.push(b.column_by_name(f.name()).unwrap().clone());
+                        cols.push(b.column_by_name(f.name()).ok_or("Missing column")?.clone());
                     }
-                    export_batches.push(RecordBatch::try_new(schema.clone(), cols).unwrap());
+                    export_batches.push(RecordBatch::try_new(schema.clone(), cols)?);
                 }
 
                 let mut sink = Vec::new();
@@ -227,15 +265,25 @@ fn run_packer(output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     &mut sink,
                     &schema,
                     IpcWriteOptions::default(),
-                )
-                .unwrap();
+                )?;
                 for b in export_batches.iter() {
-                    stream_writer.write(b).unwrap();
+                    stream_writer.write(b)?;
                 }
-                stream_writer.finish().unwrap();
-                (tid, sink)
+                stream_writer.finish()?;
+                
+                // Dynamic Schema Stripping Safety Check!
+                if sink.len() > global_schema_size {
+                    let next_bytes = &sink[global_schema_size..global_schema_size + 4];
+                    if next_bytes != [0xFF, 0xFF, 0xFF, 0xFF] {
+                        return Err("Schema size mismatch! IPC framing shifted.".into());
+                    }
+                }
+                
+                Ok((tid, sink))
             })
             .collect();
+            
+        let processed_tiles = processed_tiles_res.map_err(|e| e as Box<dyn std::error::Error>)?;
 
         for (tid, sink) in processed_tiles {
             let coord: pmtiles::TileCoord = pmtiles::TileId::new(tid).unwrap().into();
@@ -331,7 +379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 2 {
         eprintln!("Usage: arrowtiles_engine <mode> [options]");
         eprintln!("Modes:");
-        eprintln!("  --bucketer <output.parquet> <grid_size> <max_zoom>");
+        eprintln!("  --bucketer <output_dir> <grid_size> <max_zoom>");
         eprintln!("  --packer <output.arrowtiles>");
         std::process::exit(1);
     }
@@ -341,14 +389,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--bucketer" => {
             if args.len() < 5 {
                 eprintln!(
-                    "Usage: arrowtiles_engine --bucketer <output.parquet> <grid_size> <max_zoom>"
+                    "Usage: arrowtiles_engine --bucketer <output_dir> <grid_size> <max_zoom> [--x-col <col>] [--y-col <col>]"
                 );
                 std::process::exit(1);
             }
-            let output_path = &args[2];
+            let output_dir = &args[2];
             let grid_size: f64 = args[3].parse()?;
             let max_zoom: u8 = args[4].parse()?;
-            run_bucketer(output_path, grid_size, max_zoom)?;
+            
+            let mut x_col_name = "x_norm".to_string();
+            let mut y_col_name = "y_norm".to_string();
+            
+            let mut i = 5;
+            while i < args.len() {
+                if args[i] == "--x-col" && i + 1 < args.len() {
+                    x_col_name = args[i+1].clone();
+                    i += 2;
+                } else if args[i] == "--y-col" && i + 1 < args.len() {
+                    y_col_name = args[i+1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            
+            run_bucketer(output_dir, grid_size, max_zoom, &x_col_name, &y_col_name)?;
         }
         "--packer" => {
             if args.len() < 3 {

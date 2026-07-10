@@ -101,15 +101,23 @@ python arrowtiles.py --input "path/to/raw/*.parquet" --output "gaia.arrowtiles"
 | :--- | :--- |
 | `--input` | (Required) Glob path to the input Parquet files. |
 | `--output` | (Required) Path where the final `.arrowtiles` archive will be written. |
+| `--dataset` | (Optional) `gaia` (default) for astronomical Hammer projection, or `generic` for arbitrary tabular datasets mapped via `--x-col` and `--y-col`. |
+| `--x-col` | (Optional) The column name for X coordinates when using generic dataset (defaults to `x_norm`). |
+| `--y-col` | (Optional) The column name for Y coordinates when using generic dataset (defaults to `y_norm`). |
+| `--sort-col` | (Optional) The column to globally sort by for LOD/culling (defaults to `abs_m`). |
 | `--resume` | (Optional) Skips Pass 1 and resumes directly from the `bucketed_temp.parquet` file if it exists. Useful if Pass 2 crashed previously. |
 
 ### Input Data Requirements
-By default, the `arrowtiles.py` script is hardcoded to project the ESA Gaia dataset into Galactic coordinates using a Hammer projection. It expects the input Parquet files to contain at minimum:
+By default, the `arrowtiles.py` script (`--dataset gaia`) is hardcoded to project the ESA Gaia dataset into Galactic coordinates using a Hammer projection. It expects the input Parquet files to contain at minimum:
 - `ra`, `dec` (Right Ascension / Declination)
 - `magnitude` (Absolute brightness, used for LOD sorting)
 - *Additional astronomical columns (parallax, pmra, pmdec, radial_velocity)*
 
-If you are modifying the pipeline for a different dataset, simply update the SQL query inside `ArrowTilesBuilder.build()` to return standard normalized `x_norm` (FLOAT 0-1), `y_norm` (FLOAT 0-1), and `abs_m` (FLOAT).
+For non-astronomy datasets, use `--dataset generic` combined with `--x-col`, `--y-col`, and `--sort-col` to map standard spatial data directly without astronomical conversions.
+
+### Embedded PMTiles Schemas (Self-Describing Tiles)
+During the Rust `arrowtiles-engine` packing phase, the backend natively extracts the exact Apache Arrow IPC Schema from the very first binary chunk. 
+This schema is Base64-encoded and natively injected directly into the PMTiles JSON metadata under the `"arrow_schema"` key. This turns `.arrowtiles` archives into self-describing spatial data sets—any frontend client can read the global metadata to discover exactly which columns, types, and geometries exist inside the tiles without requiring hardcoded column layouts.
 
 ---
 
@@ -137,6 +145,32 @@ COPY (
     FROM 's3://esa-gaia/**/*.parquet'
 ) TO 'gaia.arrowtiles' (FORMAT ARROWTILES, MAX_CAPACITY 100000);
 ```
+
+### Phase 4: Production Hardening & Ecosystem
+1. **API Genericism & Developer Experience (DX)**
+   - **Frontend Declarative Configuration:** Instead of hacking `Scatterplot.ts` to change visual mappings, the frontend should accept a declarative JSON/JS configuration (similar to Vega-Lite). Users should be able to define mapping functions like: `{ x: 'ra', y: 'dec', color: { field: 'temperature', scale: 'viridis' } }` without touching WebGPU TSL code.
+
+2. **Testing, CI/CD, & Cross-Platform Builds**
+   - **Automated Integration Testing:** You need a CI pipeline (e.g., GitHub Actions) that runs end-to-end: generating a small dummy dataset in Python -> packing it with the Rust engine -> starting a local HTTP server -> running a headless browser (like Puppeteer/Playwright) to verify the WebGPU canvas renders without crashing.
+   - **Cross-Platform Rust Binaries:** Before you can release this to NPM or PyPI, your CI needs to automate the compilation of the Rust engine for Windows (MSVC), macOS (Apple Silicon/Intel), and Linux (GNU/Musl), so users don't have to install the Rust toolchain to use your Python/JS wrappers.
+
+3. **Graceful Degradation & Hardware Scaling**
+   - **Dynamic Cache Budgeting:** The `maxCacheSize` in the frontend is currently a static number. A production version should query `navigator.deviceMemory` (if available) or benchmark the initial WebGPU buffer allocation time to dynamically scale the tile cache and LOD threshold based on the client's actual hardware.
+   - **WebGL2 Fallback Pipeline:** WebGPU adoption is growing, but it is not ubiquitous (especially on older mobile devices or unsupported browsers). A production library needs a fallback renderer using standard WebGL2 InstancedMesh with simpler shaders, even if it means capping the point count at 5-10 million instead of 100 million.
+
+4. **Observability & Robust Error Handling**
+   - **Rust tracing & miette:** Replace the `.unwrap()` calls in your Rayon parallel iterators with Result types. Implement a library like `miette` to provide beautiful, terminal-friendly error messages that tell the user exactly which row or chunk failed (e.g., "Found NaN in column 'magnitude' at index 40592").
+   - **Frontend VRAM Telemetry:** Expose an event emitter on the TileManager that broadcasts VRAM usage and dropped frames so host applications can show warnings to the user (e.g., "Your device is running low on memory, reducing visual quality").
+
+5. **CDN & Hosting Infrastructure Guidelines**
+   - **S3/CloudFront Tuning:** Production documentation must include explicit Terraform or AWS/GCP configuration guides for setting up CORS headers, `Access-Control-Expose-Headers`, and optimizing Edge caching for byte-range requests. Without this, users will face massive latency spikes or blocked requests when trying to host their `.arrowtiles` files.
+
+### Phase 5: DeepGraph Studio (Visual Front-End for Data Scientists)
+A local-first visual desktop application (e.g., built with Tauri + Rust + WebGPU) where data scientists can:
+- Drag and drop massive datasets (Parquet, CSV, databases).
+- Visually configure coordinate mappings (`X`, `Y`) and color/magnitude scales.
+- Build the map using our DuckDB -> Rust Arrowtiles pipeline under the hood.
+- Instantly preview the rendered WebGPU map and publish it as a static HTML bundle, democratizing billion-row spatial data for non-programmers.
 
 ---
 
