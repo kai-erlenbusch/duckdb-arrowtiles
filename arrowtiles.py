@@ -8,16 +8,29 @@ import argparse
 from tqdm import tqdm
 
 class ArrowTilesBuilder:
-    def __init__(self, memory_limit="40GB", temp_dir="./duckdb_temp"):
+    def __init__(self, memory_limit="40GB", temp_dir="./duckdb_temp", threads=None):
+        import multiprocessing
+        import os
+        if threads is None:
+            # Leave at least 2 cores free for the OS and other apps
+            threads = max(1, multiprocessing.cpu_count() - 2)
+            
+        # Explicitly throttle Rust's Rayon pool before the extension is invoked
+        os.environ["RAYON_NUM_THREADS"] = str(threads)
+            
         os.makedirs(temp_dir, exist_ok=True)
         self.temp_dir = temp_dir
         self.con = duckdb.connect(config={
             'allow_unsigned_extensions': 'true', 
             'temp_directory': temp_dir, 
-            'max_memory': memory_limit
+            'max_memory': memory_limit,
+            'threads': str(threads)
         })
         # We don't need Lindel because Rust does the Hilbert calculations!
         self.con.execute("PRAGMA max_temp_directory_size='400GB';")
+        # Enable native DuckDB terminal progress bars for Pass 1 (sorting)
+        self.con.execute("PRAGMA enable_progress_bar;")
+        self.con.execute("PRAGMA enable_print_progress_bar;")
 
     def format_time(self, seconds):
         m, s = divmod(int(seconds), 60)
@@ -137,7 +150,7 @@ class ArrowTilesBuilder:
         
         packer = arrowtiles_core.ArrowTilesPacker(output_path, ptr_schema)
         
-        for part in partitions:
+        for part in tqdm(partitions, desc="Packing Tiles"):
             query_pass2 = f"""
                 SELECT * 
                 FROM read_parquet('{part}')
