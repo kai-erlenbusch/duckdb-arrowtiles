@@ -6,7 +6,7 @@
 
 ArrowTiles is a high-performance data engineering pipeline designed to process massive, out-of-core spatial datasets (like the 1.8 billion row ESA Gaia dataset) and pack them into strictly ordered, Apache Arrow IPC-encoded `.arrowtiles` (PMTiles) archives.
 
-Because statically compiling a DuckDB extension via Rust on Windows can cause MSVC standard library conflicts, this pipeline uses a decoupled **Python + Rust IPC (Inter-Process Communication)** architecture. Python orchestrates DuckDB's out-of-core sorting engine, while a dedicated Rust binary handles CPU-intensive spatial math and parallel Zstandard compression.
+Because statically compiling a DuckDB extension via Rust on Windows can cause MSVC standard library conflicts, this pipeline uses a **Native Python Extension (PyO3)** architecture. Python orchestrates DuckDB's out-of-core sorting engine, while the `arrowtiles_core` Rust module is directly imported into Python to handle CPU-intensive spatial math and parallel Zstandard compression with zero-overhead FFI bindings.
 
 ## 🚀 Performance
 The 2-pass IPC architecture completely bypasses FFI (Foreign Function Interface) memory leaks and maximizes CPU utilization. It is capable of processing **1.35 billion rows (~25 GB raw Parquet)** on consumer hardware (64GB RAM, 24-core CPU) in approximately **50 minutes**, yielding a tightly compressed 15.8 GB `.arrowtiles` archive optimized for WebGPU HTTP Range Requests.
@@ -66,13 +66,14 @@ INSTALL lindel FROM community;
 LOAD lindel;
 ```
 
-### 4. Build the Rust Engine
-Compile the highly optimized Rust ArrowTiles engine. **You must compile in release mode** to achieve acceptable throughput:
+### 4. Build the Rust Engine (PyO3)
+The high-performance Rust engine is bound to Python via PyO3. You must compile the extension in release mode using `maturin` to achieve acceptable throughput:
 ```bash
+pip install maturin
 cd arrowtiles-engine
-cargo build --release
+maturin develop --release
 ```
-*(The Python script expects the compiled binary to be located at `target/release/arrowtiles_engine.exe`)*
+*(This compiles the Rust engine and installs it into your active Python environment as `arrowtiles_core`)*
 
 ---
 
@@ -89,15 +90,16 @@ python arrowtiles.py --input "path/to/raw/*.parquet" --output "gaia.arrowtiles"
 | :--- | :--- |
 | `--input` | (Required) Glob path to the input Parquet files. |
 | `--output` | (Required) Path where the final `.arrowtiles` archive will be written. |
-| `--resume` | (Optional) Skips Pass 1 and resumes directly from the `bucketed_temp.parquet` file if it exists. Useful if Pass 2 crashed previously. |
+| `--config` | (Optional) Path to a JSON configuration file defining custom schema mappings. |
+| `--temp-dir` | (Optional) Path for intermediate DuckDB data. Defaults to `./duckdb_temp`. |
+| `--resume` | (Optional) Skips Pass 1 and resumes directly from the `bucketed_temp.parquet` file. |
 
 ### Input Data Requirements
-By default, the `arrowtiles.py` script is hardcoded to project the ESA Gaia dataset into Galactic coordinates using a Hammer projection. It expects the input Parquet files to contain at minimum:
-- `ra`, `dec` (Right Ascension / Declination)
-- `magnitude` (Absolute brightness, used for LOD sorting)
-- *Additional astronomical columns (parallax, pmra, pmdec, radial_velocity)*
+The pipeline is a **generalized data visualizer**. When running the `build_generic` pipeline, DuckDB automatically inspects your dataset's schema, identifies all numeric columns, and runs global `MIN()` and `MAX()` aggregations to establish automatic bounding stats. 
 
-If you are modifying the pipeline for a different dataset, simply update the SQL query inside `ArrowTilesBuilder.build()` to return standard normalized `x_norm` (FLOAT 0-1), `y_norm` (FLOAT 0-1), and `abs_m` (FLOAT).
+These stats are serialized into a custom JSON metadata block and injected directly into the `.arrowtiles` archive, allowing frontend GUIs to dynamically generate sliders and coordinate scales for *any* dataset.
+
+**Gaia Baseline Mode**: By default, the engine includes a specialized projection mode for the ESA Gaia dataset, expecting `ra`, `dec`, and `magnitude` columns for advanced Galactic Hammer projections.
 
 ---
 
@@ -111,7 +113,7 @@ While the core pipeline successfully processes billion-row datasets, there are s
 
 ### Phase 2: Open-Source Ecosystem Wrappers
 To make the pipeline accessible to the broader data science and web development communities, we plan to wrap the unified Rust engine using industry-standard FFI bindings:
-- **Python (PyO3 + Maturin):** Publish to PyPI so astrophysicists and data scientists can generate tiles directly in Jupyter Notebooks without installing Rust: `arrowtiles.build_lake("s3://esa-gaia", "output.arrowtiles")`.
+- **✅ Completed (PyO3 + Maturin):** The Rust engine is now natively bound to Python, allowing data scientists to generate tiles directly in Jupyter Notebooks without subprocess overhead.
 - **Node.js CLI (NAPI-RS):** Publish to NPM so web developers can quickly generate test tiles for WebGPU frontends using a simple terminal command: `npx arrowtiles build <input> <output>`.
 
 ### Phase 3: The C++ DuckDB Extension

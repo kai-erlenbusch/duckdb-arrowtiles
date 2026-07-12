@@ -1,6 +1,5 @@
 # Rust and Cargo
 target/
-Cargo.lock
 
 # Python
 __pycache__/
@@ -9,10 +8,19 @@ __pycache__/
 
 # DuckLake Data Files
 duckdb_temp/
+lmsys_temp/
+scratch_lindel/
+archive/
 *.arrowtiles
 *.parquet
 *.feather
 *.pmtiles
+
+# Logs and one-offs
+logs/
+*.log
+*.txt
+!requirements.txt
 
 # Ide and OS
 .vscode/

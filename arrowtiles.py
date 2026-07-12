@@ -8,23 +8,37 @@ import argparse
 from tqdm import tqdm
 
 class ArrowTilesBuilder:
-    def __init__(self, memory_limit="40GB", temp_dir="./duckdb_temp", threads=None):
+    def __init__(self, memory_limit="40GB", temp_dir=None, threads=None):
         import multiprocessing
         import os
+        import tempfile
+        
         if threads is None:
-            # Leave at least 2 cores free for the OS and other apps
-            threads = max(1, multiprocessing.cpu_count() - 2)
+            total_threads = max(2, multiprocessing.cpu_count() - 2)
+            duckdb_threads = int(total_threads * 0.6)
+            rayon_threads = total_threads - duckdb_threads
+        else:
+            total_threads = max(2, threads)
+            duckdb_threads = int(total_threads * 0.6)
+            rayon_threads = total_threads - duckdb_threads
             
         # Explicitly throttle Rust's Rayon pool before the extension is invoked
-        os.environ["RAYON_NUM_THREADS"] = str(threads)
+        os.environ["RAYON_NUM_THREADS"] = str(rayon_threads)
+        self.rayon_threads = rayon_threads
             
-        os.makedirs(temp_dir, exist_ok=True)
-        self.temp_dir = temp_dir
+        if temp_dir is None:
+            self._temp_dir_obj = tempfile.TemporaryDirectory(dir=".", prefix="duckdb_temp_")
+            self.temp_dir = self._temp_dir_obj.name
+        else:
+            self._temp_dir_obj = None
+            os.makedirs(temp_dir, exist_ok=True)
+            self.temp_dir = temp_dir
+            
         self.con = duckdb.connect(config={
             'allow_unsigned_extensions': 'true', 
             'temp_directory': temp_dir, 
             'max_memory': memory_limit,
-            'threads': str(threads)
+            'threads': str(duckdb_threads)
         })
         # We don't need Lindel because Rust does the Hilbert calculations!
         self.con.execute("PRAGMA max_temp_directory_size='400GB';")
@@ -44,7 +58,7 @@ class ArrowTilesBuilder:
         # in case we want to return the package path or version in the future.
         return "NATIVE_PYO3"
 
-    def build(self, input_query: str, output_path: str, sort_col: str = "abs_m", x_col: str = "x_norm", y_col: str = "y_norm", sort_dir: str = "ASC", max_capacity: int = 100000, max_zoom: int = 14, resume: bool = False):
+    def build(self, input_query: str, output_path: str, sort_col: str = "abs_m", x_col: str = "x_norm", y_col: str = "y_norm", sort_dir: str = "ASC", max_capacity: int = 100000, max_zoom: int = 14, resume: bool = False, z_buffer_limit: int = 100000, chunk_buffer_limit: int = 500000, custom_metadata: str = None):
         """
         Executes the 2-Pass DuckLake Pipeline.
         `input_query` must return `x_col` (FLOAT 0-1), `y_col` (FLOAT 0-1), and `sort_col`.
@@ -60,6 +74,7 @@ class ArrowTilesBuilder:
         
         try:
             import arrowtiles_core
+            arrowtiles_core.init_threadpool(self.rayon_threads)
         except ImportError:
             raise ImportError("Native engine not found. Run `maturin build --release` and `pip install` the resulting wheel.")
 
@@ -105,7 +120,8 @@ class ArrowTilesBuilder:
                 float(grid_size),
                 int(max_zoom),
                 x_col,
-                y_col
+                y_col,
+                int(z_buffer_limit)
             )
             
             print(f"\n[OK] Pass 1 completed in {self.format_time(time.time() - t_pass1)}", flush=True)
@@ -148,7 +164,7 @@ class ArrowTilesBuilder:
         ptr_schema = int(pc.ffi.cast("uintptr_t", c_schema_stream))
         dummy_reader._export_to_c(ptr_schema)
         
-        packer = arrowtiles_core.ArrowTilesPacker(output_path, ptr_schema)
+        packer = arrowtiles_core.ArrowTilesPacker(output_path, ptr_schema, int(chunk_buffer_limit), custom_metadata)
         
         for part in tqdm(partitions, desc="Packing Tiles"):
             query_pass2 = f"""
@@ -181,7 +197,7 @@ class ArrowTilesBuilder:
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             print(f"Final archive size: {size_mb:.2f} MB", flush=True)
 
-def build_gaia(input_parquet: str, output_path: str, resume: bool = False, memory_limit: str = "40GB"):
+def build_gaia(input_parquet: str, output_path: str, resume: bool = False, memory_limit: str = "40GB", temp_dir: str = None):
     """
     Specific helper for the Gaia dataset using the Hammer projection.
     """
@@ -223,29 +239,86 @@ def build_gaia(input_parquet: str, output_path: str, resume: bool = False, memor
         FROM wrapped
     """
     
-    builder = ArrowTilesBuilder(memory_limit=memory_limit)
-    builder.build(input_query=gaia_query, output_path=output_path, resume=resume)
+    import json
+    gaia_config = {
+        "colorField": "bp_rp",
+        "colorMin": -1.0,
+        "colorMax": 4.0,
+        "sizeField": "abs_m",
+        "sizeMin": 0.0,
+        "sizeMax": 2000.0,
+        "xField": "x_u16",
+        "yField": "y_u16",
+        "mode": "Gaia Baseline",
+        "colorScale": "viridis"
+    }
+    builder = ArrowTilesBuilder(memory_limit=memory_limit, temp_dir=temp_dir)
+    builder.build(input_query=gaia_query, output_path=output_path, resume=resume, custom_metadata=json.dumps(gaia_config))
 
-def build_generic(input_parquet: str, output_path: str, x_col: str, y_col: str, sort_col: str, resume: bool = False, memory_limit: str = "40GB"):
+def build_generic(input_parquet: str, output_path: str, x_col: str, y_col: str, sort_col: str, resume: bool = False, memory_limit: str = "40GB", temp_dir: str = None, custom_config: str = None):
     """
     Generic helper for standard spatial datasets.
     Automatically normalizes x_col and y_col to [0, 1] bounds using DuckDB.
     """
     
-    # First, get the bounds to normalize the data
+    # First, get the bounds to normalize the data and stats for numeric columns
     con = duckdb.connect()
-    bounds = con.execute(f"""
-        SELECT 
-            MIN({x_col}) as min_x, MAX({x_col}) as max_x,
-            MIN({y_col}) as min_y, MAX({y_col}) as max_y
-        FROM read_parquet('{input_parquet}')
-    """).fetchone()
     
-    min_x, max_x, min_y, max_y = bounds
+    # 1. Determine numeric columns dynamically
+    schema_query = f"DESCRIBE SELECT * FROM read_parquet('{input_parquet}')"
+    schema = con.execute(schema_query).fetchall()
+    numeric_types = ['TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT']
+    numeric_cols = [row[0] for row in schema if str(row[1]).split('(')[0].upper() in numeric_types]
+    
+    # 2. Build aggregation query
+    aggs = [
+        f"MIN({x_col}) as min_x, MAX({x_col}) as max_x",
+        f"MIN({y_col}) as min_y, MAX({y_col}) as max_y",
+        f"MIN({sort_col}) as min_sort, MAX({sort_col}) as max_sort"
+    ]
+    for col in numeric_cols:
+        aggs.append(f"MIN({col}), MAX({col})")
+        
+    bounds_query = f"SELECT {', '.join(aggs)} FROM read_parquet('{input_parquet}')"
+    bounds_row = con.execute(bounds_query).fetchone()
+    
+    min_x, max_x, min_y, max_y, min_sort, max_sort = bounds_row[0:6]
     range_x = max_x - min_x
     range_y = max_y - min_y
     if range_x == 0: range_x = 1.0
     if range_y == 0: range_y = 1.0
+    
+    # 3. Extract stats dictionary
+    stats = {}
+    for i, col in enumerate(numeric_cols):
+        min_val = bounds_row[6 + i*2]
+        max_val = bounds_row[6 + i*2 + 1]
+        if min_val is not None and max_val is not None:
+            stats[col] = {"min": float(min_val), "max": float(max_val)}
+    
+    import json
+    config_dict = {
+        "colorField": sort_col,
+        "colorMin": float(min_sort) if min_sort is not None else 0.0,
+        "colorMax": float(max_sort) if max_sort is not None else 100.0,
+        "sizeField": sort_col,
+        "sizeMin": float(min_sort) if min_sort is not None else 0.0,
+        "sizeMax": float(max_sort) if max_sort is not None else 100.0,
+        "stats": stats,
+        "xField": "x_u16",
+        "yField": "y_u16",
+        "mode": "Chart Mode",
+        "colorScale": "viridis"
+    }
+    
+    if custom_config:
+        try:
+            user_config = json.loads(custom_config)
+            config_dict.update(user_config)
+        except Exception as e:
+            print(f"Warning: Failed to parse custom_config: {e}")
+            
+    metadata_json_str = json.dumps(config_dict)
     
     generic_query = f"""
         SELECT *,
@@ -256,14 +329,15 @@ def build_generic(input_parquet: str, output_path: str, x_col: str, y_col: str, 
         LIMIT 10000000
     """
     
-    builder = ArrowTilesBuilder(memory_limit=memory_limit)
+    builder = ArrowTilesBuilder(memory_limit=memory_limit, temp_dir=temp_dir)
     builder.build(
         input_query=generic_query, 
         output_path=output_path, 
         sort_col=sort_col,
         x_col='x_norm',
         y_col='y_norm',
-        resume=resume
+        resume=resume,
+        custom_metadata=metadata_json_str
     )
 
 if __name__ == "__main__":
@@ -278,16 +352,23 @@ if __name__ == "__main__":
     parser.add_argument("--x-col", type=str, default="x_norm", help="The column name for X coordinates (0.0 to 1.0)")
     parser.add_argument("--y-col", type=str, default="y_norm", help="The column name for Y coordinates (0.0 to 1.0)")
     parser.add_argument("--sort-col", type=str, default="abs_m", help="The column to globally sort by for LOD/culling")
+    parser.add_argument("--config", type=str, default=None, help="JSON string for visualization config overrides")
     
     # System arguments
     parser.add_argument("--resume", action="store_true", help="Resume from Pass 2 if Pass 1 completed")
     parser.add_argument("--memory-limit", type=str, default="40GB", help="DuckDB max_memory limit")
+    parser.add_argument("--temp-dir", type=str, default=None, help="Explicit temp directory (defaults to tempfile if not resuming, or ./duckdb_temp if resuming)")
     
     args = parser.parse_args()
     
+    # If resuming and no temp dir was explicitly provided, default to ./duckdb_temp 
+    # to find previous partitions
+    if args.resume and args.temp_dir is None:
+        args.temp_dir = "./duckdb_temp"
+    
     if args.dataset == "gaia":
         print("🌌 Running ESA Gaia Pipeline...")
-        build_gaia(args.input, args.output, args.resume, args.memory_limit)
+        build_gaia(args.input, args.output, args.resume, args.memory_limit, args.temp_dir)
     elif args.dataset == "generic":
         print(f"📦 Running Generic Pipeline (X: {args.x_col}, Y: {args.y_col}, Sort: {args.sort_col})...")
         build_generic(
@@ -297,5 +378,7 @@ if __name__ == "__main__":
             y_col=args.y_col,
             sort_col=args.sort_col,
             resume=args.resume,
-            memory_limit=args.memory_limit
+            memory_limit=args.memory_limit,
+            temp_dir=args.temp_dir,
+            custom_config=args.config
         )
